@@ -1,0 +1,834 @@
+# Copyright 2026 KAUST Computational Imaging Group, Xinge Yang and DeepLens contributors.
+# This file is part of DeepLens (https://github.com/singer-yang/DeepLens).
+#
+# Licensed under the Apache License, Version 2.0.
+# See LICENSE file in the project root for full license information.
+
+"""Optimization and constraint functions for GeoLens.
+
+Differentiable lens design has several advantages over conventional lens design:
+    1. AutoDiff gradient calculation is faster and numerically more stable, which is important for complex optical systems.
+    2. First-order optimization with momentum (e.g., Adam) is typically more stable than second-order optimization, and also has promising convergence speed.
+    3. Efficient definition of loss functions can prevent the lens from violating constraints.
+
+References:
+    Xinge Yang, Qiang Fu, and Wolfgang Heidrich, "Curriculum learning for ab initio deep learned refractive optics," Nature Communications 2024.
+
+Functions:
+    - init_constraints: Initialize constraints for the lens design
+    - loss_reg: An empirical regularization loss for lens design
+    - loss_infocus: Sample parallel rays and compute RMS loss on the sensor plane
+    - loss_surface: Penalize surface shape (sag, diameter-to-thickness ratio, etc.)
+    - loss_intersec: Loss function to avoid self-intersection
+    - loss_thickness: Penalize excessive air gaps, lens thicknesses, and total track length
+    - loss_ray_angle: Loss function to penalize large chief ray angle
+    - loss_rms: Loss function to compute RGB spot error RMS
+    - sample_ring_arm_rays: Sample rays from object space using a ring-arm pattern
+    - optimize: Optimize the lens by minimizing rms errors
+"""
+
+import logging
+import os
+from datetime import datetime
+
+import numpy as np
+import torch
+from tqdm import tqdm
+from transformers import get_cosine_schedule_with_warmup
+
+from ..config import (
+    DEFAULT_WAVE,
+    DEPTH,
+    EPSILON,
+    GEO_GRID,
+    SPP_CALC,
+    SPP_PSF,
+    WAVE_RGB,
+)
+from ..geometric_surface import Aperture, Aspheric, Plane, Spheric, ThinLens
+from ..phase_surface import Phase
+
+
+class GeoLensOptim:
+    """Mixin providing differentiable optimisation for ``GeoLens``.
+
+    Implements gradient-based lens design using PyTorch autograd:
+
+    * **Loss functions** – RMS spot error, focus, surface regularity, gap
+      constraints, material validity.
+    * **Constraint initialisation** – edge-thickness and self-intersection
+      guards.
+    * **Optimizer helpers** – parameter groups with per-type learning rates
+      and cosine annealing schedules.
+    * **High-level ``optimize()``** – curriculum-learning training loop.
+
+    This class is not instantiated directly; it is mixed into
+    :class:`~deeplens.optics.geolens.GeoLens`.
+
+    References:
+        Xinge Yang et al., "Curriculum learning for ab initio deep learned
+        refractive optics," *Nature Communications* 2024.
+    """
+
+    # ================================================================
+    # Lens design constraints
+    # ================================================================
+    def init_constraints(self, constraint_params=None):
+        """Initialize constraints for the lens design.
+        
+        Args:
+            constraint_params (dict): Constraint parameters.
+        """
+        # In the future, we want to use constraint_params to set the constraints.
+        if constraint_params is None:
+            constraint_params = {}
+            print("Lens design constraints initialized with default values.")
+
+        if self.r_sensor < 12.0:
+            self.is_cellphone = True
+
+            # Self intersection lower bounds
+            self.air_min_edge = 0.05
+            self.air_min_center = 0.05
+            self.thick_min_edge = 0.25
+            self.thick_min_center = 0.4
+            self.bfl_min = 0.8
+
+            # Air gap and thickness upper bounds
+            self.air_max_edge = 3.0
+            self.air_max_center = 1.5
+            self.thick_max_edge = 2.0
+            self.thick_max_center = 3.0
+            self.bfl_max = 3.0
+            self.ttl_max = 15.0
+
+            # Surface shape constraints
+            self.sag2diam_max = 0.1
+            self.grad_max = 0.57 # tan(30deg)
+            self.diam2thick_max = 15.0
+            self.tmax2tmin_max = 5.0
+            
+            # Ray angle constraints
+            self.chief_ray_angle_max = 30.0 # deg
+            self.obliq_min = 0.6
+        
+        else:
+            self.is_cellphone = False
+
+            # Self-intersection lower bounds
+            self.air_min_edge = 0.1
+            self.air_min_center = 0.1
+            self.thick_min_edge = 1.0
+            self.thick_min_center = 2.0
+            self.bfl_min = 5.0
+            
+            # Air gap and thickness upper bounds
+            self.air_max_edge = 100.0  # float("inf")
+            self.air_max_center = 100.0  # float("inf")
+            self.thick_max_edge = 20.0
+            self.thick_max_center = 20.0
+            self.bfl_max = 100.0  # float("inf")
+            self.ttl_max = 300.0
+
+            # Surface shape constraints
+            self.sag2diam_max = 0.2
+            self.grad_max = 0.84 # tan(40deg)
+            self.diam2thick_max = 20.0
+            self.tmax2tmin_max = 10.0
+            
+            # Ray angle constraints
+            self.chief_ray_angle_max = 40.0 # deg
+            self.obliq_min = 0.4
+
+    def loss_reg(self, w_focus=10.0, w_ray_angle=2.0, w_intersec=1.0, w_thickness=0.1, w_surf=1.0):
+        """Compute combined regularization loss for lens design.
+
+        Aggregates multiple constraint losses to keep the lens physically valid
+        during gradient-based optimisation.
+
+        Args:
+            w_focus (float, optional): Weight for focus loss. Defaults to 10.0.
+            w_ray_angle (float, optional): Weight for chief ray angle loss. Defaults to 2.0.
+            w_intersec (float, optional): Weight for self-intersection loss. Defaults to 1.0.
+            w_thickness (float, optional): Weight for thickness / TTL loss. Defaults to 0.1.
+            w_surf (float, optional): Weight for surface shape loss. Defaults to 1.0.
+
+        Returns:
+            tuple: (loss_reg, loss_dict) where:
+                - loss_reg (Tensor): Scalar combined regularization loss.
+                - loss_dict (dict): Per-component loss values for logging.
+        """
+        # Loss functions for regularization
+        # loss_focus = self.loss_infocus()
+        loss_ray_angle = self.loss_ray_angle()
+        loss_intersec = self.loss_intersec()
+        loss_thickness = self.loss_thickness()
+        loss_surf = self.loss_surface()
+        # loss_mat = self.loss_mat()
+        loss_reg = (
+            # w_focus * loss_focus
+            + w_intersec * loss_intersec
+            + w_thickness * loss_thickness
+            + w_surf * loss_surf
+            + w_ray_angle * loss_ray_angle
+            # + loss_mat
+        )
+
+        # Return loss and loss dictionary
+        loss_dict = {
+            # "loss_focus": loss_focus.item(),
+            "loss_intersec": loss_intersec.item(),
+            "loss_thickness": loss_thickness.item(),
+            "loss_surf": loss_surf.item(),
+            'loss_ray_angle': loss_ray_angle.item(),
+            # 'loss_mat': loss_mat.item(),
+        }
+        return loss_reg, loss_dict
+
+    def loss_infocus(self, target=0.005):
+        """Sample parallel rays and compute RMS loss on the sensor plane, minimize focus loss.
+
+        Args:
+            target (float, optional): target of RMS loss. Defaults to 0.005 [mm].
+        """
+        loss = torch.tensor(0.0, device=self.device)
+
+        # Ray tracing and calculate RMS error
+        ray = self.sample_from_fov(fov_x=0.0, fov_y=0.0, wvln=WAVE_RGB[1], num_rays=SPP_CALC)
+        ray = self.trace2sensor(ray)
+        rms_error = ray.rms_error()
+
+        # If RMS error is larger than target, add it to loss
+        if rms_error > target:
+            loss += rms_error
+
+        return loss
+
+    def loss_surface(self):
+        """Penalize extreme surface shapes that are difficult to manufacture.
+
+        Checks four constraints for each optimisable surface:
+            1. Sag-to-diameter ratio exceeding ``sag2diam_max``.
+            2. Maximum surface gradient exceeding ``grad_max``.
+            3. Diameter-to-thickness ratio exceeding ``diam2thick_max``.
+            4. Maximum-to-minimum thickness ratio exceeding ``tmax2tmin_max``.
+
+        Returns:
+            Tensor: Scalar surface shape penalty loss.
+        """
+        sag2diam_max = self.sag2diam_max
+        grad_max_allowed = self.grad_max
+        diam2thick_max = self.diam2thick_max
+        tmax2tmin_max = self.tmax2tmin_max
+
+        loss_grad = torch.tensor(0.0, device=self.device)
+        loss_diam2thick = torch.tensor(0.0, device=self.device)
+        loss_tmax2tmin = torch.tensor(0.0, device=self.device)
+        loss_sag2diam = torch.tensor(0.0, device=self.device)
+        for i in self.find_diff_surf():
+            # Sample points on the surface
+            x_ls = torch.linspace(0.0, 1.0, 32, device=self.device) * self.surfaces[i].r
+            y_ls = torch.zeros_like(x_ls)
+
+            # Sag
+            sag_ls = self.surfaces[i].sag(x_ls, y_ls)
+            sag2diam = sag_ls.abs().max() / self.surfaces[i].r / 2
+            if sag2diam > sag2diam_max:
+                loss_sag2diam += sag2diam
+
+            # 1st-order derivative
+            grad_ls = self.surfaces[i].dfdxyz(x_ls, y_ls)[0]
+            grad_max = grad_ls.abs().max()
+            if grad_max > grad_max_allowed:
+                loss_grad += grad_max
+
+            # Diameter to thickness ratio, thick_max to thick_min ratio
+            if not self.surfaces[i].mat2.name == "air":
+                surf2 = self.surfaces[i + 1]
+                surf1 = self.surfaces[i]
+
+                # Penalize diameter to thickness ratio
+                diam2thick = 2 * max(surf2.r, surf1.r) / (surf2.d - surf1.d)
+                if diam2thick > diam2thick_max:
+                    loss_diam2thick += diam2thick
+
+                # Penalize thick_max to thick_min ratio.
+                # Clamp denominators to avoid Inf from near-zero edge thickness.
+                r_edge = min(surf2.r, surf1.r)
+                thick_center = surf2.d - surf1.d
+                thick_edge = surf2.surface_with_offset(r_edge, 0.0) - surf1.surface_with_offset(r_edge, 0.0)
+                if thick_center > thick_edge:
+                    tmax2tmin = thick_center / thick_edge.clamp(min=0.01)
+                else:
+                    tmax2tmin = thick_edge / max(thick_center, 0.01)
+
+                if tmax2tmin > tmax2tmin_max:
+                    loss_tmax2tmin += tmax2tmin
+
+        return loss_sag2diam + loss_grad + loss_diam2thick + loss_tmax2tmin
+
+    def loss_intersec(self):
+        """Loss function to avoid self-intersection.
+
+        This function penalizes when surfaces are too close to each other,
+        which could cause self-intersection or manufacturing issues.
+        """
+        # Constraints
+        air_min_center = self.air_min_center
+        air_min_edge = self.air_min_edge
+        thick_min_center = self.thick_min_center
+        thick_min_edge = self.thick_min_edge
+        bfl_min = self.bfl_min
+
+        # Loss
+        loss = torch.tensor(0.0, device=self.device)
+        for i in range(len(self.surfaces) - 1):
+            # Sample evaluation points on the two surfaces
+            current_surf = self.surfaces[i]
+            next_surf = self.surfaces[i + 1]
+            
+            r_center = torch.tensor(0.0, device=self.device) * current_surf.r
+            z_prev_center = current_surf.surface_with_offset(r_center, 0.0, valid_check=False)
+            z_next_center = next_surf.surface_with_offset(r_center, 0.0, valid_check=False)
+
+            r_edge = torch.linspace(0.5, 1.0, 16, device=self.device) * current_surf.r
+            z_prev_edge = current_surf.surface_with_offset(r_edge, 0.0, valid_check=False)
+            z_next_edge = next_surf.surface_with_offset(r_edge, 0.0, valid_check=False)
+
+            # Next surface is air
+            if self.surfaces[i].mat2.name == "air":
+                # Center air gap
+                dist_center = z_next_center - z_prev_center
+                if dist_center < air_min_center:
+                    loss += dist_center
+
+                # Edge air gap
+                dist_edge = torch.min(z_next_edge - z_prev_edge)
+                if dist_edge < air_min_edge:
+                    loss += dist_edge
+
+            # Next surface is lens
+            else:
+                # Center thickness
+                dist_center = z_next_center - z_prev_center
+                if dist_center < thick_min_center:
+                    loss += dist_center
+
+                # Edge thickness
+                dist_edge = torch.min(z_next_edge - z_prev_edge)
+                if dist_edge < thick_min_edge:
+                    loss += dist_edge
+
+        # Distance to sensor (back focal length)
+        last_surf = self.surfaces[-1]
+        r = torch.linspace(0.0, 1.0, 32, device=self.device) * last_surf.r
+        z_last_surf = self.d_sensor - last_surf.surface_with_offset(r, 0.0)
+
+        bfl = torch.min(z_last_surf)
+        if bfl < bfl_min:
+            loss += bfl
+
+        # Loss, maximize loss
+        return -loss
+
+    def loss_thickness(self):
+        """Penalize excessive air gaps, lens thicknesses, and total track length.
+
+        Checks three types of upper-bound constraints:
+            1. Per-gap air and glass thickness (center and edge).
+            2. Back focal length (BFL).
+            3. Total track length (TTL) from first surface to sensor.
+
+        Returns:
+            Tensor: Scalar thickness penalty loss.
+        """
+        # Constraints
+        air_max_center = self.air_max_center
+        air_max_edge = self.air_max_edge
+        thick_max_center = self.thick_max_center
+        thick_max_edge = self.thick_max_edge
+        bfl_max = self.bfl_max
+        ttl_max = self.ttl_max
+
+        # Loss
+        loss = torch.tensor(0.0, device=self.device)
+
+        # Distance between surfaces
+        for i in range(len(self.surfaces) - 1):
+            # Sample evaluation points on the two surfaces
+            current_surf = self.surfaces[i]
+            next_surf = self.surfaces[i + 1]
+
+            r_center = torch.tensor(0.0, device=self.device) * current_surf.r
+            z_prev_center = current_surf.surface_with_offset(r_center, 0.0, valid_check=False)
+            z_next_center = next_surf.surface_with_offset(r_center, 0.0, valid_check=False)
+
+            r_edge = torch.linspace(0.5, 1.0, 16, device=self.device) * current_surf.r
+            z_prev_edge = current_surf.surface_with_offset(r_edge, 0.0, valid_check=False)
+            z_next_edge = next_surf.surface_with_offset(r_edge, 0.0, valid_check=False)
+
+            # Air gap
+            if self.surfaces[i].mat2.name == "air":
+                # Center air gap
+                dist_center = z_next_center - z_prev_center
+                if dist_center > air_max_center:
+                    loss += dist_center
+
+                # Edge air gap
+                dist_edge = torch.max(z_next_edge - z_prev_edge)
+                if dist_edge > air_max_edge:
+                    loss += dist_edge
+
+            # Lens thickness
+            else:
+                # Center thickness
+                dist_center = z_next_center - z_prev_center
+                if dist_center > thick_max_center:
+                    loss += dist_center
+
+                # Edge thickness
+                dist_edge = torch.max(z_next_edge - z_prev_edge)
+                if dist_edge > thick_max_edge:
+                    loss += dist_edge
+
+        # Distance to sensor (back focal length)
+        last_surf = self.surfaces[-1]
+        r = torch.linspace(0.0, 1.0, 32, device=self.device) * last_surf.r
+        z_last_surf = self.d_sensor - last_surf.surface_with_offset(r, 0.0)
+
+        bfl = torch.max(z_last_surf)
+        if bfl > bfl_max:
+            loss += bfl
+
+        # Total track length (first surface to sensor)
+        ttl = self.d_sensor - self.surfaces[0].d
+        if ttl > ttl_max:
+            loss += ttl
+
+        # Loss, minimize loss
+        return loss
+
+    def loss_ray_angle(self):
+        """Penalize large chief ray angles and low obliquity factors.
+
+        Ensures that rays arrive at the sensor within acceptable incidence
+        angles, which is critical for sensor coupling and colour cross-talk.
+
+        Returns:
+            Tensor: Scalar chief-ray-angle penalty loss.
+        """
+        max_angle_deg = self.chief_ray_angle_max
+        obliq_min = self.obliq_min
+
+        # Loss on chief ray angle
+        ray = self.sample_ring_arm_rays(num_ring=8, num_arm=8, spp=SPP_CALC, scale_pupil=0.2)
+        ray = self.trace2sensor(ray)
+        cos_cra = ray.d[..., 2]
+        cos_cra_ref = float(np.cos(np.deg2rad(max_angle_deg)))
+        mask_cra = (cos_cra < cos_cra_ref).float()
+        count_cra = mask_cra.sum()
+        loss_cra = -(cos_cra * mask_cra).sum() / (count_cra + EPSILON)
+
+        # Loss on accumulated oblique term
+        ray = self.sample_ring_arm_rays(num_ring=8, num_arm=8, spp=SPP_CALC, scale_pupil=1.0)
+        ray = self.trace2sensor(ray)
+        obliq = ray.obliq.squeeze(-1)
+        mask_obliq = (obliq < obliq_min).float()
+        count_obliq = mask_obliq.sum()
+        loss_obliq = -(obliq * mask_obliq).sum() / (count_obliq + EPSILON)
+
+        return loss_cra + loss_obliq
+
+    def loss_mat(self):
+        """Penalize material parameters outside manufacturable ranges.
+
+        Constrains refractive index *n* to [1.5, 1.9] and Abbe number *V* to
+        [30, 70] for each non-air surface material.
+
+        Returns:
+            Tensor: Scalar material penalty loss.
+        """
+        n_max = 1.9
+        n_min = 1.5
+        V_max = 70
+        V_min = 30
+        loss_mat = torch.tensor(0.0, device=self.device)
+        for i in range(len(self.surfaces)):
+            if self.surfaces[i].mat2.name != "air":
+                if self.surfaces[i].mat2.n > n_max:
+                    loss_mat += (self.surfaces[i].mat2.n - n_max) / (n_max - n_min)
+                if self.surfaces[i].mat2.n < n_min:
+                    loss_mat += (n_min - self.surfaces[i].mat2.n) / (n_max - n_min)
+                if self.surfaces[i].mat2.V > V_max:
+                    loss_mat += (self.surfaces[i].mat2.V - V_max) / (V_max - V_min)
+                if self.surfaces[i].mat2.V < V_min:
+                    loss_mat += (V_min - self.surfaces[i].mat2.V) / (V_max - V_min)
+        
+        return loss_mat
+
+    # ================================================================
+    # Loss functions for image quality
+    # ================================================================
+    def loss_rms(
+        self,
+        num_grid=GEO_GRID,
+        depth=DEPTH,
+        num_rays=SPP_PSF,
+        sample_more_off_axis=False,
+    ):
+        """Loss function to compute RGB spot error RMS.
+
+        Args:
+            num_grid (int, optional): Number of grid points. Defaults to GEO_GRID.
+            depth (float, optional): Depth of the lens. Defaults to DEPTH.
+            num_rays (int, optional): Number of rays. Defaults to SPP_CALC.
+            sample_more_off_axis (bool, optional): Whether to sample more off-axis rays. Defaults to False.
+
+        Returns:
+            avg_rms_error (torch.Tensor): RMS error averaged over wavelengths and grid points.
+        """
+        all_rms_errors = []
+        for i, wvln in enumerate([WAVE_RGB[1], WAVE_RGB[0], WAVE_RGB[2]]):
+            ray = self.sample_grid_rays(
+                depth=depth,
+                num_grid=num_grid,
+                num_rays=num_rays,
+                wvln=wvln,
+                sample_more_off_axis=sample_more_off_axis,
+            )
+
+            # Calculate reference center, shape of (..., 2)
+            if i == 0:
+                with torch.no_grad():
+                    ray_center_green = -self.psf_center(points_obj=ray.o[:, :, 0, :], method="pinhole")
+
+            ray = self.trace2sensor(ray)
+
+            # # Green light centroid for reference
+            # if i == 0:
+            #     with torch.no_grad():
+            #         ray_center_green = ray.centroid()
+
+            # Calculate RMS error with reference center
+            rms_error = ray.rms_error(center_ref=ray_center_green)
+            all_rms_errors.append(rms_error)
+
+        # Calculate average RMS error
+        avg_rms_error = torch.stack(all_rms_errors).mean(dim=0)
+        return avg_rms_error
+
+    # ================================================================
+    # Example optimization function
+    # ================================================================
+    def sample_ring_arm_rays(self, num_ring=8, num_arm=8, spp=2048, depth=DEPTH, wvln=DEFAULT_WAVE, scale_pupil=1.0, sample_more_off_axis=True):
+        """Sample rays from object space using a ring-arm pattern.
+
+        This method distributes sampling points (origins of ray bundles) on a polar grid in the object plane,
+        defined by field of view. This is useful for capturing lens performance across the full field.
+        The points include the center and `num_ring` rings with `num_arm` points on each.
+
+        Args:
+            num_ring (int): Number of rings to sample in the field of view.
+            num_arm (int): Number of arms (spokes) to sample for each ring.
+            spp (int): Total number of rays to be sampled, distributed among field points.
+            depth (float): Depth of the object plane.
+            wvln (float): Wavelength of the rays.
+            scale_pupil (float): Scale factor for the pupil size.
+
+        Returns:
+            Ray: A Ray object containing the sampled rays.
+        """
+        # Create points on rings and arms
+        max_fov_rad = self.rfov
+        if sample_more_off_axis:
+            # Use beta distribution to sample more points near the edge (close to 1.0)
+            # Beta(0.5, 0.5) gives more samples at 0 and 1, Beta(0.5, 0.3) gives more samples near 1.0
+            beta_values = torch.linspace(0.0, 1.0, num_ring, device=self.device)
+            # Apply beta transformation to concentrate samples near 1.0
+            beta_transformed = beta_values ** 0.5  # Equivalent to Beta(0.5, 1.0) distribution
+            ring_fovs = max_fov_rad * beta_transformed
+
+            # Use square root to sample more points near the edge
+            # ring_fovs = max_fov_rad * torch.sqrt(torch.linspace(0.0, 1.0, num_ring, device=self.device))
+        else:
+            ring_fovs = max_fov_rad * torch.linspace(0.0, 1.0, num_ring, device=self.device)
+        
+        arm_angles = torch.linspace(0.0, 2 * torch.pi, num_arm + 1, device=self.device)[:-1]
+        ring_grid, arm_grid = torch.meshgrid(ring_fovs, arm_angles, indexing="ij")
+        x = depth * torch.tan(ring_grid) * torch.cos(arm_grid)
+        y = depth * torch.tan(ring_grid) * torch.sin(arm_grid)        
+        z = torch.full_like(x, depth)
+        points = torch.stack([x, y, z], dim=-1)  # shape: [num_ring, num_arm, 3]
+
+        # Sample rays
+        rays = self.sample_from_points(points=points, num_rays=spp, wvln=wvln, scale_pupil=scale_pupil)
+        return rays
+
+    def optimize(
+        self,
+        lrs=[1e-3, 1e-4, 1e-1, 1e-4],
+        iterations=5000,
+        test_per_iter=100,
+        centroid=False,
+        optim_mat=False,
+        shape_control=True,
+        result_dir=None,
+    ):
+        """Optimise the lens by minimising RGB RMS spot errors.
+
+        Runs a curriculum-learning training loop with Adam optimiser and cosine
+        annealing. Periodically evaluates the lens, saves intermediate results,
+        and optionally corrects surface shapes.
+
+        Args:
+            lrs (list, optional): Learning rates for [d, c, k, a] parameter groups.
+                Defaults to [1e-3, 1e-4, 1e-1, 1e-4].
+            iterations (int, optional): Total training iterations. Defaults to 5000.
+            test_per_iter (int, optional): Evaluate and save every N iterations.
+                Defaults to 100.
+            centroid (bool, optional): If True, use chief-ray centroid as PSF centre
+                reference; otherwise use pinhole model. Defaults to False.
+            optim_mat (bool, optional): If True, include material parameters (n, V)
+                in optimisation. Defaults to False.
+            shape_control (bool, optional): If True, call ``correct_shape()`` at each
+                evaluation step. Defaults to True.
+            result_dir (str, optional): Directory to save results. If None,
+                auto-generates a timestamped directory. Defaults to None.
+
+        Note:
+            Debug hints:
+                1. Slowly optimise with small learning rate.
+                2. FoV and thickness should match well.
+                3. Keep parameter ranges reasonable.
+                4. Higher aspheric order is better but more sensitive.
+                5. More iterations with larger ray sampling improves convergence.
+        """
+        # Experiment settings
+        depth = DEPTH
+        num_ring = 32
+        num_arm = 8
+        spp = 2048
+
+        # Result directory and logger
+        if result_dir is None:
+            result_dir = f"./results/{datetime.now().strftime('%m%d-%H%M%S')}-DesignLens"
+
+        os.makedirs(result_dir, exist_ok=True)
+        if not logging.getLogger().hasHandlers():
+            logger = logging.getLogger()
+            logger.setLevel("DEBUG")
+            fmt = logging.Formatter("%(asctime)s:%(levelname)s:%(message)s", "%Y-%m-%d %H:%M:%S")
+            sh = logging.StreamHandler()
+            sh.setFormatter(fmt)
+            sh.setLevel("INFO")
+            fh = logging.FileHandler(f"{result_dir}/output.log")
+            fh.setFormatter(fmt)
+            fh.setLevel("INFO")
+            logger.addHandler(sh)
+            logger.addHandler(fh)
+        logging.info(f"lr:{lrs}, iterations:{iterations}, num_ring:{num_ring}, num_arm:{num_arm}, rays_per_fov:{spp}.")
+        logging.info("If Out-of-Memory, try to reduce num_ring, num_arm, and rays_per_fov.")
+
+        # Optimizer and scheduler
+        optimizer = self.get_optimizer(lrs, optim_mat=optim_mat)
+        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=100, num_training_steps=iterations)
+
+        # Training loop
+        pbar = tqdm(
+            total=iterations + 1,
+            desc="Progress",
+            postfix={"loss_rms": 0, "loss_focus": 0},
+        )
+        for i in range(iterations + 1):
+            # ===> Evaluate the lens
+            if i % test_per_iter == 0:
+                with torch.no_grad():
+                    if shape_control and i > 0:
+                        self.correct_shape()
+                        # self.refocus()
+
+                    self.write_lens_json(f"{result_dir}/iter{i}.json")
+                    self.analysis(f"{result_dir}/iter{i}")
+            
+                    # Sample rays
+                    self.calc_pupil()
+                    rays_backup = []
+                    for wv in WAVE_RGB:
+                        ray = self.sample_ring_arm_rays(num_ring=num_ring, num_arm=num_arm, spp=spp, depth=depth, wvln=wv, scale_pupil=1.05, sample_more_off_axis=False)
+                        rays_backup.append(ray)
+
+                    # Calculate ray centers
+                    if centroid:
+                        center_ref = -self.psf_center(points_obj=ray.o[:, :, 0, :], method="chief_ray")
+                        center_ref = center_ref.unsqueeze(-2).repeat(1, 1, spp, 1)
+                    else:
+                        center_ref = -self.psf_center(points_obj=ray.o[:, :, 0, :], method="pinhole")
+                        center_ref = center_ref.unsqueeze(-2).repeat(1, 1, spp, 1)
+
+            # ===> Optimize lens by minimizing RMS
+            loss_rms_ls = []
+            for wv_idx, wv in enumerate(WAVE_RGB):
+                # Ray tracing to sensor, [num_grid, num_grid, num_rays, 3]
+                ray = rays_backup[wv_idx].clone()
+                ray = self.trace2sensor(ray)
+
+                # Ray error to center and valid mask.
+                # Use torch.where to zero out invalid rays BEFORE squaring,
+                # preventing NaN from Inf*0 (IEEE 754: inf * 0 = nan).
+                ray_xy = ray.o[..., :2]
+                ray_valid = ray.is_valid
+                ray_err = ray_xy - center_ref
+                ray_err = torch.where(
+                    ray_valid.bool().unsqueeze(-1), ray_err, torch.zeros_like(ray_err)
+                )
+
+                # Weight mask, shape of [num_grid, num_grid]
+                if wv_idx == 0:
+                    with torch.no_grad():
+                        weight_mask = (ray_err**2).sum(-1).sum(-1)
+                        weight_mask /= ray_valid.sum(-1) + EPSILON
+                        weight_mask /= weight_mask.mean() + EPSILON
+
+                # Loss on RMS error
+                l_rms = (ray_err**2).sum(-1).sum(-1)
+                l_rms /= ray_valid.sum(-1) + EPSILON
+                l_rms = (l_rms + EPSILON).sqrt()
+
+                # Weighted loss
+                l_rms_weighted = (l_rms * weight_mask).sum()
+                l_rms_weighted /= weight_mask.sum() + EPSILON
+                loss_rms_ls.append(l_rms_weighted)
+
+            # RMS loss for all wavelengths
+            loss_rms = sum(loss_rms_ls) / len(loss_rms_ls)
+
+            # Total loss
+            w_focus = 1.0
+            loss_focus = self.loss_infocus()
+            
+            w_reg = 0.1
+            loss_reg, loss_dict = self.loss_reg()
+            
+            L_total = loss_rms + w_focus * loss_focus + w_reg * loss_reg
+
+            # Back-propagation
+            optimizer.zero_grad()
+            L_total.backward()
+            optimizer.step()
+            scheduler.step()
+
+            pbar.set_postfix(loss_rms=loss_rms.item(), loss_focus=loss_focus.item(), **loss_dict)
+            pbar.update(1)
+
+        pbar.close()
+
+    # ====================================================================================
+    # Optimizer helpers
+    # ====================================================================================
+    def get_optimizer_params(
+        self,
+        lrs=[1e-4, 1e-4, 1e-2, 1e-4],
+        optim_mat=False,
+        optim_surf_range=None,
+    ):
+        """Get optimizer parameters for different lens surface.
+
+        Recommendation:
+            For cellphone lens: [d, c, k, a], [1e-4, 1e-4, 1e-1, 1e-4]
+            For camera lens: [d, c, 0, 0], [1e-3, 1e-4, 0, 0]
+
+        Args:
+            lrs (list): learning rate for different parameters.
+            optim_mat (bool): whether to optimize material. Defaults to False.
+            optim_surf_range (list): surface indices to be optimized. Defaults to None.
+
+        Returns:
+            list: optimizer parameters
+        """
+        # Find surfaces to be optimized
+        if optim_surf_range is None:
+            # optim_surf_range = self.find_diff_surf()
+            optim_surf_range = range(len(self.surfaces))
+
+        # If lr for each surface is a list is given
+        if isinstance(lrs[0], list):
+            return self.get_optimizer_params_manual(
+                lrs=lrs, optim_mat=optim_mat, optim_surf_range=optim_surf_range
+            )
+
+        # Optimize lens surface parameters
+        params = []
+        for surf_idx in optim_surf_range:
+            surf = self.surfaces[surf_idx]
+
+            if isinstance(surf, Aperture):
+                params += surf.get_optimizer_params(lrs=[lrs[0]])
+
+            elif isinstance(surf, Aspheric):
+                params += surf.get_optimizer_params(
+                    lrs=lrs[:4], optim_mat=optim_mat
+                )
+
+            elif isinstance(surf, Phase):
+                params += surf.get_optimizer_params(lrs=[lrs[0], lrs[4]])
+
+            # elif isinstance(surf, GaussianRBF):
+            #     params += surf.get_optimizer_params(lrs=lr, optim_mat=optim_mat)
+
+            # elif isinstance(surf, NURBS):
+            #     params += surf.get_optimizer_params(lrs=lr, optim_mat=optim_mat)
+
+            elif isinstance(surf, Plane):
+                params += surf.get_optimizer_params(lrs=[lrs[0]], optim_mat=optim_mat)
+
+            # elif isinstance(surf, PolyEven):
+            #     params += surf.get_optimizer_params(lrs=lr, optim_mat=optim_mat)
+
+            elif isinstance(surf, Spheric):
+                params += surf.get_optimizer_params(
+                    lrs=[lrs[0], lrs[1]], optim_mat=optim_mat
+                )
+
+            elif isinstance(surf, ThinLens):
+                params += surf.get_optimizer_params(
+                    lrs=[lrs[0], lrs[1]], optim_mat=optim_mat
+                )
+
+            else:
+                raise Exception(
+                    f"Surface type {surf.__class__.__name__} is not supported for optimization yet."
+                )
+
+        # Optimize sensor place
+        self.d_sensor.requires_grad = True
+        params += [{"params": self.d_sensor, "lr": lrs[0]}]
+
+        return params
+
+    def get_optimizer(
+        self,
+        lrs=[1e-4, 1e-4, 1e-1, 1e-4],
+        optim_surf_range=None,
+        optim_mat=False,
+    ):
+        """Get optimizers and schedulers for different lens parameters.
+
+        Args:
+            lrs (list): learning rate for different parameters [c, d, k, a]. Defaults to [1e-4, 1e-4, 0, 1e-4].
+            optim_surf_range (list): surface indices to be optimized. Defaults to None.
+            optim_mat (bool): whether to optimize material. Defaults to False.
+
+        Returns:
+            list: optimizer parameters
+        """
+        # Initialize lens design constraints (edge thickness, etc.)
+        self.init_constraints()
+
+        # Get optimizer
+        params = self.get_optimizer_params(
+            lrs=lrs, optim_surf_range=optim_surf_range, optim_mat=optim_mat
+        )
+        optimizer = torch.optim.Adam(params)
+        # optimizer = torch.optim.SGD(params)
+        return optimizer
+
