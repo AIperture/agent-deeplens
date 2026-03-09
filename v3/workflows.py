@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,6 @@ from .backend import (
     load_lens,
     persist_output_files,
 )
-from .types import DeepLensState
 
 
 @graph_fn(
@@ -71,26 +71,18 @@ async def deeplens_v3_optimize_workflow(
             "result_dir": "",
         }
 
-    task = type(
-        "WorkflowTask",
-        (),
-        {
-            "attachments": [],
-            "lens_source": lens_source or {},
-        },
-    )()
-    state = DeepLensState(active_source_ref=lens_source or {})
     lens, source = await load_lens(
         resolved_inputs={"lens_source": lens_source or {}},
-        task=task,
-        state=state,
         context=context,
+        active_source_ref=lens_source or {},
     )
     _GeoLens, _create_lens = _import_deeplens()
 
     result_dir = Path(await context.artifacts().stage_dir("_deeplens_optimize"))
     result_dir.mkdir(parents=True, exist_ok=True)
-    lens.optimize(
+    # CPU-bound – run in a thread so we don't block the event loop.
+    await asyncio.to_thread(
+        lens.optimize,
         iterations=iterations,
         test_per_iter=max(1, checkpoint_every),
         result_dir=str(result_dir),

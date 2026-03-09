@@ -4,13 +4,14 @@ import json
 from dataclasses import asdict
 from typing import Any
 
-from .memory_policy import build_context_bundle
-from .router import (
-    _extract_analysis_request,
-    _extract_design_spec,
-    _extract_run_request,
-    _missing_fields_for_domain,
+from .extraction import (
+    extract_analysis_request,
+    extract_design_spec,
+    extract_run_request,
 )
+from .memory_policy import build_context_bundle
+from .plan import advance_plan, build_plan, plan_from_dict, plan_step_to_action, plan_to_dict
+from .router import _missing_fields_for_domain
 from .tool_dispatch import dispatch_tool_action
 from .tool_registry import get_tool_spec
 from .types import DEEPLENS_SKILL_ID, LoopAction, TaskShape, save_state
@@ -69,6 +70,43 @@ def _default_ask_prompt(task: Any) -> str:
     return "Please provide the missing information so I can continue."
 
 
+def _consume_requested_next_step(state: Any) -> LoopAction | None:
+    """Consume `requested_next_step` from state and return a deterministic action, or None."""
+    step = state.requested_next_step
+    if not step:
+        return None
+    state.requested_next_step = None
+    if step == "interpret_or_export":
+        return {
+            "kind": "respond",
+            "name": None,
+            "args": {"text": "Analysis complete. You can review the results above, or ask me to export or optimize."},
+            "rationale": "Interpreting analysis results.",
+        }
+    if step == "analyze_or_optimize":
+        return {
+            "kind": "respond",
+            "name": None,
+            "args": {"text": "Design created. You can ask me to analyze it, optimize it, or export it."},
+            "rationale": "Suggesting next steps after design.",
+        }
+    if step == "share_or_optimize":
+        return {
+            "kind": "respond",
+            "name": None,
+            "args": {"text": "Export complete. You can optimize the lens or start a new design."},
+            "rationale": "Suggesting next steps after export.",
+        }
+    if step == "status_or_cancel":
+        return {
+            "kind": "respond",
+            "name": None,
+            "args": {"text": "Background run submitted. Use ‘status’ to check progress or ‘cancel’ to stop it."},
+            "rationale": "Guiding user after run submission.",
+        }
+    return None
+
+
 def _fallback_next_action(task: Any, state: Any) -> LoopAction:
     missing = list(getattr(task, "missing_fields", []) or [])
     preferred_tool = getattr(task, "preferred_tool", None)
@@ -86,6 +124,10 @@ def _fallback_next_action(task: Any, state: Any) -> LoopAction:
             "args": {"prompt": _default_ask_prompt(task)},
             "rationale": "Required inputs are still missing.",
         }
+    # Consume requested_next_step if set (from a prior tool result).
+    next_step_action = _consume_requested_next_step(state)
+    if next_step_action is not None:
+        return next_step_action
     if task.task_shape == TaskShape.RUN_CONTROL and preferred_tool in {"ag.status", "ag.cancel"}:
         return {
             "kind": "tool_call",
@@ -122,27 +164,51 @@ def _fallback_next_action(task: Any, state: Any) -> LoopAction:
     }
 
 
-async def _send_loop_note(
+def _is_deterministic(task: Any, state: Any) -> bool:
+    """Check if the next action can be determined without an LLM call."""
+    if task.task_shape in (TaskShape.DIRECT_ANSWER, TaskShape.UNSUPPORTED):
+        return True
+    if task.task_shape == TaskShape.RUN_CONTROL:
+        return True
+    if state.requested_next_step:
+        return True
+    missing = list(getattr(task, "missing_fields", []) or [])
+    if missing:
+        return True
+    preferred_tool = getattr(task, "preferred_tool", None)
+    if preferred_tool:
+        return True
+    return False
+
+
+async def _emit_loop_update(
     chan: Any,
     *,
-    text: str,
+    phase: str,
+    phase_status: str,
+    label: str,
+    detail: str,
     step_index: int,
     kind: str,
+    note_text: str | None = None,
     tool_name: str | None = None,
-    status: str | None = None,
+    loop_status: str | None = None,
 ) -> None:
-    await chan.send_text(
-        text,
-        memory_log=True,
-        memory_tags=["ag.deeplens.v3.progress", f"loop_kind:{kind}"],
-        memory_data={
-            "step_index": step_index,
-            "kind": kind,
-            "tool_name": tool_name,
-            "status": status,
-        },
-        memory_severity=1,
-    )
+    """Emit a phase update and optionally a memory-logged note in a single call."""
+    await chan.send_phase(phase=phase, status=phase_status, label=label, detail=detail)
+    if note_text:
+        await chan.send_text(
+            note_text,
+            memory_log=True,
+            memory_tags=["ag.deeplens.v3.progress", f"loop_kind:{kind}"],
+            memory_data={
+                "step_index": step_index,
+                "kind": kind,
+                "tool_name": tool_name,
+                "status": loop_status or phase_status,
+            },
+            memory_severity=1,
+        )
 
 
 def _merge_task_update_from_user(*, task: Any, text: str, files: list[dict[str, Any]]) -> None:
@@ -173,19 +239,19 @@ def _merge_task_update_from_user(*, task: Any, text: str, files: list[dict[str, 
             }
 
     if answer:
-        design_spec = _extract_design_spec(answer)
+        design_spec = extract_design_spec(answer)
         if design_spec:
             merged_design = dict(task.design_spec or {})
             merged_design.update({k: v for k, v in design_spec.items() if v is not None})
             task.design_spec = merged_design
 
-        run_request = _extract_run_request(answer)
+        run_request = extract_run_request(answer)
         if run_request:
             merged_run = dict(task.run_request or {})
             merged_run.update(run_request)
             task.run_request = merged_run
 
-        analysis_request = _extract_analysis_request(answer, task.attachments or [])
+        analysis_request = extract_analysis_request(answer, task.attachments or [])
         if analysis_request:
             merged_analysis = dict(task.analysis_request or {})
             merged_analysis.update({k: v for k, v in analysis_request.items() if v is not None})
@@ -196,9 +262,15 @@ def _merge_task_update_from_user(*, task: Any, text: str, files: list[dict[str, 
     task.missing_fields = _missing_fields_for_domain(task.domain_hint, task)
 
 
-async def refresh_loop_context(task: Any, state: Any, context: Any, context_mode: Any) -> Any:
+async def _save_loop_state(task: Any, state: Any, context: Any) -> None:
+    """Cheap: sync active task into state and persist. No context rebuild."""
     _sync_active_task(state, task)
     await save_state(context=context, state=state)
+
+
+async def refresh_loop_context(task: Any, state: Any, context: Any, context_mode: Any) -> Any:
+    """Expensive: save state AND rebuild the full context bundle from memory."""
+    await _save_loop_state(task, state, context)
     return await build_context_bundle(
         context_mode=context_mode,
         task=task,
@@ -374,18 +446,15 @@ async def run_loop(
     context: Any,
 ) -> dict[str, Any]:
     chan = context.channel("ui:session")
-    await chan.send_phase(
+    await _emit_loop_update(
+        chan,
         phase="execution",
-        status="active",
+        phase_status="active",
         label="Running loop",
         detail=f"domain={task.domain_hint.value} shape={task.task_shape.value}",
-    )
-    await _send_loop_note(
-        chan,
-        text=f"I’m handling this as a {task.domain_hint.value} workflow.",
         step_index=0,
         kind="start",
-        status="active",
+        note_text=f"I’m handling this as a {task.domain_hint.value} workflow.",
     )
     context_bundle = await refresh_loop_context(
         task=task,
@@ -393,216 +462,227 @@ async def run_loop(
         context=context,
         context_mode=context_mode,
     )
+    # Build or restore a multi-step plan for known workflows.
+    plan = plan_from_dict(state.active_plan) or build_plan(task, state)
+    state.active_plan = plan_to_dict(plan)
+
+    result_out: dict[str, Any] | None = None
     max_steps = _max_steps(task.task_shape)
-    for step_index in range(max_steps):
-        await chan.send_phase(
-            phase="execution.step",
-            status="active",
-            label=f"Loop step {step_index + 1}",
-            detail="Choosing the next bounded action.",
-        )
-        action = await propose_next_action(
-            task=task,
-            state=state,
-            context_bundle=context_bundle,
-            step_index=step_index,
-            context=context,
-        )
-        await chan.send_phase(
-            phase="execution.step",
-            status="active",
-            label=f"Loop step {step_index + 1}",
-            detail=f"Proposed {_format_action_detail(action)}",
-        )
-        ok, err = validate_action(action=action)
-        if not ok:
-            _append_trace(state, {"step_index": step_index, "action": action, "error": err})
-            context_bundle = await refresh_loop_context(
-                task=task,
-                state=state,
-                context=context,
-                context_mode=context_mode,
-            )
-            retries = _increment_retry(state, "validation")
-            if retries > 2:
-                return {
-                    "reply": f"I stopped because loop validation failed repeatedly: {err}",
-                    "state": state,
-                }
-            continue
-        _reset_retry(state, "validation")
-        _append_trace(state, {"step_index": step_index, "action": action})
-        kind = action["kind"]
-        if kind == "ask_user":
-            prompt = action["args"].get("prompt") or "Please provide the missing information."
+    try:
+        for step_index in range(max_steps):
             await chan.send_phase(
                 phase="execution.step",
                 status="active",
                 label=f"Loop step {step_index + 1}",
-                detail="Waiting for user input.",
+                detail="Choosing the next bounded action.",
             )
-            await _send_loop_note(
-                chan,
-                text="I need a few required inputs before I can continue.",
-                step_index=step_index,
-                kind=kind,
-                status="waiting_for_user",
-            )
-            state.pending_action = "ask_user"
-            state.pending_approval = None
-            state.approved_action = None
-            context_bundle = await refresh_loop_context(
-                task=task,
-                state=state,
-                context=context,
-                context_mode=context_mode,
-            )
-            reply = await chan.ask_text_or_files(prompt=prompt)
-            answer = str(reply.get("text") or "")
-            files = reply.get("files") or []
-            _merge_task_update_from_user(task=task, text=answer, files=files)
-            state.pending_action = None
-            _sync_active_task(state, task)
-            context_bundle = await refresh_loop_context(
-                task=task,
-                state=state,
-                context=context,
-                context_mode=context_mode,
-            )
-            continue
-        if kind == "request_approval":
-            prompt = (
-                action["args"].get("approval_prompt")
-                or action["args"].get("prompt")
-                or "Approve this action?"
-            )
-            target_name = action.get("name") or task.preferred_tool
+            # 1) Try the plan first (deterministic, no LLM).
+            action = None
+            if plan is not None:
+                step_str = advance_plan(plan)
+                if step_str is not None:
+                    action = plan_step_to_action(step_str, task, state)
+                state.active_plan = plan_to_dict(plan)
+
+            # 2) If plan didn’t produce an action, try deterministic fallback.
+            if action is None and _is_deterministic(task, state):
+                action = _fallback_next_action(task, state)
+
+            # 3) Last resort: LLM-based propose.
+            if action is None:
+                action = await propose_next_action(
+                    task=task,
+                    state=state,
+                    context_bundle=context_bundle,
+                    step_index=step_index,
+                    context=context,
+                )
             await chan.send_phase(
                 phase="execution.step",
                 status="active",
                 label=f"Loop step {step_index + 1}",
-                detail=f"Requesting approval for {target_name or 'next action'}.",
+                detail=f"Proposed {_format_action_detail(action)}",
             )
-            await _send_loop_note(
-                chan,
-                text=f"I’m ready to proceed with `{target_name or 'the next action'}` and need your approval first.",
-                step_index=step_index,
-                kind=kind,
-                tool_name=target_name,
-                status="awaiting_approval",
-            )
-            state.pending_action = "request_approval"
-            state.pending_approval = {
-                "prompt": prompt,
-                "step_index": step_index,
-                "action": target_name,
-            }
-            context_bundle = await refresh_loop_context(
-                task=task,
-                state=state,
-                context=context,
-                context_mode=context_mode,
-            )
-            resp = await chan.ask_approval(prompt=prompt, options=["Approve", "Reject"])
-            approved = bool(resp.get("approved"))
-            task.notes.append(f"approval:{'approved' if approved else 'rejected'}:{prompt}")
-            state.pending_action = None
-            state.pending_approval = None
-            state.approved_action = target_name if approved else None
-            context_bundle = await refresh_loop_context(
-                task=task,
-                state=state,
-                context=context,
-                context_mode=context_mode,
-            )
-            if not approved:
-                return {"reply": "Okay, I stopped before making changes.", "state": state}
-            continue
-        if kind == "tool_call":
-            tool_name = action.get("name")
-            state.pending_action = tool_name
-            state.pending_approval = None
-            await chan.send_phase(
-                phase="execution.step",
-                status="active",
-                label=f"Loop step {step_index + 1}",
-                detail=f"Executing {tool_name or 'tool'}.",
-            )
-            await _send_loop_note(
-                chan,
-                text=f"I’m executing `{tool_name or 'the selected tool'}` now.",
-                step_index=step_index,
-                kind=kind,
-                tool_name=tool_name,
-                status="running",
-            )
-            context_bundle = await refresh_loop_context(
-                task=task,
-                state=state,
-                context=context,
-                context_mode=context_mode,
-            )
-            result = await dispatch_tool_action(
-                action=action,
-                task=task,
-                state=state,
-                context_bundle=context_bundle,
-                context=context,
-            )
-            _append_trace(
-                state,
-                {
-                    "step_index": step_index,
-                    "tool_name": tool_name,
-                    "summary": result.summary,
-                    "ok": result.ok,
-                    "status": result.status,
-                },
-            )
-            state.pending_action = None
-            task.notes.append(
-                f"tool_result:{tool_name}:{'ok' if result.ok else 'error'}:{result.status}"
-            )
-            await chan.send_phase(
-                phase="execution.step",
-                status="active" if result.ok and not result.should_end_turn else "completed",
-                label=f"Loop step {step_index + 1}",
-                detail=f"{tool_name or 'tool'} -> {result.status}",
-            )
-            await _send_loop_note(
-                chan,
-                text=result.summary,
-                step_index=step_index,
-                kind=kind,
-                tool_name=tool_name,
-                status=result.status,
-            )
-            context_bundle = await refresh_loop_context(
-                task=task,
-                state=state,
-                context=context,
-                context_mode=context_mode,
-            )
-            if not result.ok:
-                retries = _increment_retry(state, tool_name or "tool")
+            ok, err = validate_action(action=action)
+            if not ok:
+                _append_trace(state, {"step_index": step_index, "action": action, "error": err})
+                await _save_loop_state(task, state, context)
+                retries = _increment_retry(state, "validation")
                 if retries > 2:
-                    return {
-                        "reply": f"I stopped after repeated failures while executing `{tool_name}`.",
+                    result_out = {
+                        "reply": f"I stopped because loop validation failed repeatedly: {err}",
                         "state": state,
                     }
+                    return result_out
                 continue
-            _reset_retry(state, tool_name or "tool")
-            if result.should_end_turn:
-                return {"reply": result.summary, "state": state}
-            continue
-        if kind == "respond":
-            return {"reply": action["args"].get("text") or "Done.", "state": state}
-        if kind == "finish":
-            return {"reply": "Done.", "state": state}
-        if kind == "fail":
-            return {
-                "reply": action["args"].get("text")
-                or "This DeepLens agent does not support that request yet.",
-                "state": state,
-            }
-    return {"reply": "I stopped after the current step budget.", "state": state}
+            _reset_retry(state, "validation")
+            kind = action["kind"]
+            # For tool_call, trace is recorded after execution with the result merged in.
+            if kind != "tool_call":
+                _append_trace(state, {"step_index": step_index, "action": action})
+            if kind == "ask_user":
+                prompt = action["args"].get("prompt") or "Please provide the missing information."
+                await _emit_loop_update(
+                    chan,
+                    phase="execution.step",
+                    phase_status="active",
+                    label=f"Loop step {step_index + 1}",
+                    detail="Waiting for user input.",
+                    step_index=step_index,
+                    kind=kind,
+                    note_text="I need a few required inputs before I can continue.",
+                    loop_status="waiting_for_user",
+                )
+                state.pending_action = "ask_user"
+                state.pending_approval = None
+                state.approved_action = None
+                await _save_loop_state(task, state, context)
+                reply = await chan.ask_text_or_files(prompt=prompt)
+                answer = str(reply.get("text") or "")
+                files = reply.get("files") or []
+                _merge_task_update_from_user(task=task, text=answer, files=files)
+                state.pending_action = None
+                _sync_active_task(state, task)
+                context_bundle = await refresh_loop_context(
+                    task=task,
+                    state=state,
+                    context=context,
+                    context_mode=context_mode,
+                )
+                continue
+            if kind == "request_approval":
+                prompt = (
+                    action["args"].get("approval_prompt")
+                    or action["args"].get("prompt")
+                    or "Approve this action?"
+                )
+                target_name = action.get("name") or task.preferred_tool
+                approval_detail = f"Requesting approval for {target_name}." if target_name else "Requesting approval for next action."
+                approval_note = f"I’m ready to proceed with `{target_name}` and need your approval first." if target_name else "I’m ready to proceed and need your approval first."
+                await _emit_loop_update(
+                    chan,
+                    phase="execution.step",
+                    phase_status="active",
+                    label=f"Loop step {step_index + 1}",
+                    detail=approval_detail,
+                    step_index=step_index,
+                    kind=kind,
+                    note_text=approval_note,
+                    tool_name=target_name,
+                    loop_status="awaiting_approval",
+                )
+                state.pending_action = "request_approval"
+                state.pending_approval = {
+                    "prompt": prompt,
+                    "step_index": step_index,
+                    "action": target_name,
+                }
+                await _save_loop_state(task, state, context)
+                resp = await chan.ask_approval(prompt=prompt, options=["Approve", "Reject"])
+                approved = bool(resp.get("approved"))
+                approval_str = "approved" if approved else "rejected"
+                task.notes.append(f"approval:{approval_str}:{prompt}")
+                state.pending_action = None
+                state.pending_approval = None
+                state.approved_action = target_name if approved else None
+                await _save_loop_state(task, state, context)
+                if not approved:
+                    result_out = {"reply": "Okay, I stopped before making changes.", "state": state}
+                    return result_out
+                continue
+            if kind == "tool_call":
+                tool_name = action.get("name")
+                tool_label = tool_name or "tool"
+                state.pending_action = tool_name
+                state.pending_approval = None
+                await _emit_loop_update(
+                    chan,
+                    phase="execution.step",
+                    phase_status="active",
+                    label=f"Loop step {step_index + 1}",
+                    detail=f"Executing {tool_label}.",
+                    step_index=step_index,
+                    kind=kind,
+                    note_text=f"I’m executing `{tool_label}` now.",
+                    tool_name=tool_name,
+                    loop_status="running",
+                )
+                await _save_loop_state(task, state, context)
+                result = await dispatch_tool_action(
+                    action=action,
+                    task=task,
+                    state=state,
+                    context_bundle=context_bundle,
+                    context=context,
+                )
+                _append_trace(
+                    state,
+                    {
+                        "step_index": step_index,
+                        "tool_name": tool_name,
+                        "rationale": action.get("rationale"),
+                        "summary": result.summary,
+                        "ok": result.ok,
+                        "status": result.status,
+                    },
+                )
+                state.pending_action = None
+                result_ok_str = "ok" if result.ok else "error"
+                task.notes.append(f"tool_result:{tool_name}:{result_ok_str}:{result.status}")
+                result_phase_status = "active" if result.ok and not result.should_end_turn else "done"
+                await _emit_loop_update(
+                    chan,
+                    phase="execution.step",
+                    phase_status=result_phase_status,
+                    label=f"Loop step {step_index + 1}",
+                    detail=f"{tool_label} -> {result.status}",
+                    step_index=step_index,
+                    kind=kind,
+                    note_text=result.summary,
+                    tool_name=tool_name,
+                    loop_status=result.status,
+                )
+                context_bundle = await refresh_loop_context(
+                    task=task,
+                    state=state,
+                    context=context,
+                    context_mode=context_mode,
+                )
+                if not result.ok:
+                    retries = _increment_retry(state, tool_name or "tool")
+                    if retries > 2:
+                        result_out = {
+                            "reply": f"I stopped after repeated failures while executing `{tool_name}`.",
+                            "state": state,
+                        }
+                        return result_out
+                    continue
+                _reset_retry(state, tool_name or "tool")
+                if result.should_end_turn:
+                    result_out = {"reply": result.summary, "state": state}
+                    return result_out
+                continue
+            if kind == "respond":
+                result_out = {"reply": action["args"].get("text") or "Done.", "state": state}
+                return result_out
+            if kind == "finish":
+                result_out = {"reply": "Done.", "state": state}
+                return result_out
+            if kind == "fail":
+                result_out = {
+                    "reply": action["args"].get("text")
+                    or "This DeepLens agent does not support that request yet.",
+                    "state": state,
+                }
+                return result_out
+        result_out = {"reply": "I stopped after the current step budget.", "state": state}
+        return result_out
+    finally:
+        # Always emit a final "done" phase so the UI clears the progress indicator.
+        reply_text = (result_out or {}).get("reply", "Loop ended.")
+        await chan.send_phase(
+            phase="execution",
+            status="done",
+            label="Loop finished",
+            detail=reply_text[:120],
+        )

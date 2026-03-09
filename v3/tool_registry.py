@@ -126,7 +126,7 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
     "ag.status": ToolSpec(
         name="ag.status",
         category=ToolCategory.AG,
-        execution_style=ToolExecutionStyle.SPAWN_AND_WAIT_SHORT,
+        execution_style=ToolExecutionStyle.INLINE,
         executor_key="ag.status",
         description="Check a child run and summarize its current status.",
         argument_hints={

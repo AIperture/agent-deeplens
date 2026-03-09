@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
+
+from .extraction import (
+    extract_design_spec,
+    infer_analysis_mode,
+    infer_export_formats,
+)
 
 
 REFINABLE_TOOLS = {
@@ -26,83 +31,6 @@ def _extract_latest_user_answer(task: Any) -> str:
     return ""
 
 
-def _extract_design_spec_from_text(text: str) -> dict[str, Any]:
-    spec: dict[str, Any] = {}
-    if not text:
-        return spec
-
-    foclen_match = re.search(r"(\d+(?:\.\d+)?)\s*mm", text, re.IGNORECASE)
-    if foclen_match:
-        spec["foclen"] = float(foclen_match.group(1))
-
-    fnum_match = re.search(r"f\s*/\s*(\d+(?:\.\d+)?)", text, re.IGNORECASE)
-    if fnum_match:
-        spec["fnum"] = float(fnum_match.group(1))
-
-    sensor_match = re.search(r"(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)\s*mm", text, re.IGNORECASE)
-    if sensor_match:
-        width = float(sensor_match.group(1))
-        height = float(sensor_match.group(2))
-        spec["sensor_width_mm"] = width
-        spec["sensor_height_mm"] = height
-        spec["imgh"] = max(width, height) / 2.0
-        if spec.get("foclen") is not None and spec.get("fov") is None:
-            spec["fov"] = round(2.0 * 180.0 / 3.141592653589793 * __import__("math").atan((width / 2.0) / spec["foclen"]), 3)
-
-    wavelengths = re.findall(r"(\d+(?:\.\d+)?)\s*nm", text, re.IGNORECASE)
-    if wavelengths:
-        spec["wvlns"] = [float(item) for item in wavelengths]
-
-    save_match = re.search(r"\b(?:as|named?)\s+([A-Za-z0-9_.-]+)", text)
-    if save_match and ("json" in text.lower() or "zmx" in text.lower()):
-        spec["save_name"] = save_match.group(1).removesuffix(".json").removesuffix(".zmx")
-
-    lowered = text.lower()
-    if (
-        "use defaults" in lowered
-        or "use default" in lowered
-        or "sensible defaults" in lowered
-        or "sensible default" in lowered
-        or "default config" in lowered
-    ):
-        spec.setdefault("fov", 40.0)
-        spec.setdefault("fnum", 2.8)
-        spec.setdefault("foclen", 35.0)
-        spec.setdefault("wvlns", [486.0, 588.0, 656.0])
-        spec.setdefault("sensor_width_mm", 36.0)
-        spec.setdefault("sensor_height_mm", 24.0)
-        spec.setdefault("imgh", 18.0)
-        spec.setdefault("save_name", "deeplens_design")
-
-    return spec
-
-
-def _infer_analysis_request(text: str, draft_inputs: dict[str, Any]) -> dict[str, Any]:
-    analysis_request = dict(draft_inputs.get("analysis_request") or {})
-    lowered = text.lower()
-    if "mtf" in lowered and analysis_request.get("mode") in {None, "full"}:
-        analysis_request["mode"] = "mtf"
-    if "spot" in lowered and analysis_request.get("mode") in {None, "full"}:
-        analysis_request["mode"] = "spot"
-    if "rms" in lowered and analysis_request.get("mode") in {None, "full"}:
-        analysis_request["mode"] = "rms"
-    if not analysis_request:
-        analysis_request["mode"] = "full"
-    return analysis_request
-
-
-def _infer_formats(text: str, draft_inputs: dict[str, Any]) -> list[str]:
-    formats = list(draft_inputs.get("formats") or [])
-    lowered = text.lower()
-    if "json" in lowered and "json" not in formats:
-        formats.append("json")
-    if "zmx" in lowered and "zmx" not in formats:
-        formats.append("zmx")
-    if not formats:
-        formats = ["json", "zmx"]
-    return formats
-
-
 def _heuristic_refine_inputs(*, spec: Any, draft_inputs: dict[str, Any], task: Any) -> dict[str, Any]:
     refined = dict(draft_inputs)
     latest_answer = _extract_latest_user_answer(task)
@@ -113,21 +41,21 @@ def _heuristic_refine_inputs(*, spec: Any, draft_inputs: dict[str, Any], task: A
 
     if spec.name == "dl.create_lens":
         design_spec = dict(refined.get("design_spec") or {})
-        inferred_spec = _extract_design_spec_from_text(hint_text)
+        inferred_spec = extract_design_spec(hint_text)
         for key, value in inferred_spec.items():
             design_spec.setdefault(key, value)
         if design_spec:
             refined["design_spec"] = design_spec
-        refined["analysis_request"] = _infer_analysis_request(hint_text, refined)
-        refined["formats"] = _infer_formats(hint_text, refined)
+        refined["analysis_request"] = infer_analysis_mode(hint_text, refined.get("analysis_request"))
+        refined["formats"] = infer_export_formats(hint_text, refined.get("formats"))
 
     if spec.name == "dl.analysis":
-        refined["analysis_request"] = _infer_analysis_request(hint_text, refined)
+        refined["analysis_request"] = infer_analysis_mode(hint_text, refined.get("analysis_request"))
         if refined.get("design_spec"):
             refined.setdefault("create_if_missing", True)
 
     if spec.name == "dl.export_lens":
-        refined["formats"] = _infer_formats(hint_text, refined)
+        refined["formats"] = infer_export_formats(hint_text, refined.get("formats"))
 
     return refined
 

@@ -3,9 +3,15 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
+from .extraction import (
+    attachment_suggests_lens,
+    extract_analysis_request,
+    extract_design_spec,
+    extract_run_request,
+    missing_design_fields,
+)
 from .types import (
     ContextMode,
     DEEPLENS_SKILL_ID,
@@ -31,111 +37,11 @@ def _default_context_mode(state: DeepLensState) -> ContextMode:
     return ContextMode.FULL if state.context_mode == "full" else ContextMode.LITE
 
 
-def _extract_number(message: str, patterns: list[str]) -> float | None:
-    for pattern in patterns:
-        match = re.search(pattern, message, flags=re.IGNORECASE)
-        if match:
-            try:
-                return float(match.group(1))
-            except Exception:
-                continue
-    return None
-
-
-def _extract_design_spec(message: str) -> dict[str, Any]:
-    msg = message or ""
-    lowered = msg.lower()
-    spec: dict[str, Any] = {}
-    fov = _extract_number(msg, [r"fov\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)", r"([0-9]+(?:\.[0-9]+)?)\s*deg(?:ree)?s?\s*fov"])
-    fnum = _extract_number(msg, [r"f/?#?\s*([0-9]+(?:\.[0-9]+)?)", r"fnum\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)"])
-    foclen = _extract_number(msg, [r"foc(?:al)?(?:len| length)?\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)", r"([0-9]+(?:\.[0-9]+)?)\s*mm\s*focal"])
-    imgh = _extract_number(msg, [r"imgh\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)", r"image height\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)"])
-    bfl = _extract_number(msg, [r"bfl\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)"])
-    thickness = _extract_number(msg, [r"thickness\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)"])
-    if fov is not None:
-        spec["fov"] = fov
-    if fnum is not None:
-        spec["fnum"] = fnum
-    if foclen is not None:
-        spec["foclen"] = foclen
-    if imgh is not None:
-        spec["imgh"] = imgh
-    if bfl is not None:
-        spec["bfl"] = bfl
-    if thickness is not None:
-        spec["thickness"] = thickness
-    if "camera" in lowered:
-        spec["lens_class"] = "camera"
-    if "cellphone" in lowered or "mobile" in lowered:
-        spec["lens_class"] = "cellphone"
-    if "not " in lowered or "don't" in lowered:
-        exclusions = re.findall(r"(?:not|don't)\s+([a-zA-Z_ ]+)", lowered)
-        if exclusions:
-            spec["excluded_objectives"] = [x.strip() for x in exclusions[:5]]
-    if (
-        "use defaults" in lowered
-        or "use default" in lowered
-        or "sensible defaults" in lowered
-        or "sensible default" in lowered
-        or "default config" in lowered
-    ):
-        spec.setdefault("fov", 40.0)
-        spec.setdefault("fnum", 2.8)
-        spec.setdefault("foclen", 35.0)
-        spec.setdefault("wvlns", [486.0, 588.0, 656.0])
-        spec.setdefault("sensor_width_mm", 36.0)
-        spec.setdefault("sensor_height_mm", 24.0)
-        spec.setdefault("imgh", 18.0)
-        spec.setdefault("save_name", "deeplens_design")
-    return spec
-
-
-def _extract_analysis_request(message: str, attachments: list[dict[str, Any]]) -> dict[str, Any]:
-    msg = (message or "").lower()
-    mode = "full"
-    if "spot" in msg:
-        mode = "spot"
-    elif "mtf" in msg:
-        mode = "mtf"
-    elif "rms" in msg:
-        mode = "rms"
-    source_refs = []
-    for attachment in attachments:
-        name = attachment.get("name") or attachment.get("filename") or attachment.get("uri")
-        source_refs.append({"name": name, "artifact_id": attachment.get("artifact_id"), "uri": attachment.get("uri")})
-    return {"mode": mode, "source_refs": source_refs}
-
-
-def _extract_run_request(message: str) -> dict[str, Any]:
-    msg = message or ""
-    iterations = _extract_number(msg, [r"iterations?\s*[:=]?\s*([0-9]+)", r"for\s*([0-9]+)\s*iters"])
-    checkpoint_every = _extract_number(msg, [r"checkpoint(?: every)?\s*[:=]?\s*([0-9]+)", r"every\s*([0-9]+)\s*iterations"])
-    request = {}
-    if iterations is not None:
-        request["iterations"] = int(iterations)
-    if checkpoint_every is not None:
-        request["checkpoint_every"] = int(checkpoint_every)
-    if "stub" in msg.lower():
-        request["use_stub"] = True
-    return request
-
-
 def _missing_fields_for_domain(domain_hint: DomainHint, task: DeepLensTask) -> list[str]:
     if domain_hint == DomainHint.DESIGN:
-        missing = []
-        if task.design_spec.get("fov") is None:
-            missing.append("fov")
-        if task.design_spec.get("fnum") is None:
-            missing.append("fnum")
-        if task.design_spec.get("foclen") is None and task.design_spec.get("imgh") is None:
-            missing.append("foclen_or_imgh")
-        return missing
+        return missing_design_fields(task.design_spec)
     if domain_hint in {DomainHint.ANALYSIS, DomainHint.OPTIMIZATION}:
-        has_lens_attachment = any(
-            str((a.get("name") or a.get("filename") or a.get("uri") or "")).lower().endswith((".json", ".zmx"))
-            for a in task.attachments
-        )
-        if not has_lens_attachment:
+        if not attachment_suggests_lens(task.attachments):
             return ["lens_source"]
     return []
 
@@ -161,9 +67,9 @@ def _make_task(
     missing_fields: list[str] | None = None,
     preferred_tool: str | None = None,
 ) -> DeepLensTask:
-    design_spec = _extract_design_spec(message)
-    analysis_request = _extract_analysis_request(message, attachments)
-    run_request = _extract_run_request(message)
+    design_spec = extract_design_spec(message)
+    analysis_request = extract_analysis_request(message, attachments)
+    run_request = extract_run_request(message)
     task = DeepLensTask(
         user_goal=message,
         task_shape=task_shape,
@@ -321,8 +227,48 @@ def apply_slash_command(
     )
 
 
-def _state_sensitive_route(message: str, state: DeepLensState) -> RouteDecision | None:
+def _detect_run_completed_pickup(
+    message: str,
+    user_meta: dict[str, Any] | None = None,
+) -> str | None:
+    """Detect structured run-completion pickup messages sent by the UI toast action."""
+    # Check user_meta for structured type (from RunsPollingBridge sendMessage meta)
+    if user_meta and user_meta.get("type") == "run_completed" and user_meta.get("run_id"):
+        return str(user_meta["run_id"])
+    # Also match the text pattern "Show results for completed run <run_id>"
+    m = re.search(r"results?\s+for\s+(?:completed?\s+)?run\s+([a-zA-Z0-9_-]{8,})", (message or "").lower())
+    if m:
+        return m.group(1)
+    return None
+
+
+def _state_sensitive_route(
+    message: str,
+    state: DeepLensState,
+    user_meta: dict[str, Any] | None = None,
+) -> RouteDecision | None:
     msg = (message or "").strip().lower()
+
+    # Run-completion pickup (from UI toast "View Results" action)
+    pickup_run_id = _detect_run_completed_pickup(message, user_meta)
+    if pickup_run_id:
+        return {
+            "task_shape": TaskShape.RUN_CONTROL,
+            "domain_hint": DomainHint.OPTIMIZATION,
+            "preferred_tool": "ag.status",
+            "context_mode": _default_context_mode(state),
+            "reason": "state:run_completed_pickup",
+            "confidence": 1.0,
+            "task": DeepLensTask(
+                user_goal=message,
+                task_shape=TaskShape.RUN_CONTROL,
+                domain_hint=DomainHint.OPTIMIZATION,
+                parsed_args={"run_id": pickup_run_id},
+                preferred_tool="ag.status",
+                run_request={"run_id": pickup_run_id},
+            ),
+        }
+
     if state.active_run_id and any(k in msg for k in ("status", "still running", "cancel", "stop", "abort")):
         preferred_tool = "ag.cancel" if any(k in msg for k in ("cancel", "stop", "abort")) else "ag.status"
         return {
@@ -359,35 +305,10 @@ def _message_mentions_optimization(msg: str) -> bool:
     return any(k in msg for k in keywords)
 
 
-def _attachment_suggests_lens(attachments: list[dict[str, Any]]) -> bool:
-    for attachment in attachments:
-        name = attachment.get("name") or attachment.get("filename") or attachment.get("uri") or ""
-        if Path(str(name)).suffix.lower() in {".json", ".zmx"}:
-            return True
-    return False
-
-
 def _fallback_route(message: str, attachments: list[dict[str, Any]], state: DeepLensState) -> RouteDecision:
     msg = (message or "").lower()
-    if any(k in msg for k in ("cancel", "status", "still running", "stop", "abort")) and state.active_run_id:
-        preferred_tool = "ag.cancel" if any(k in msg for k in ("cancel", "stop", "abort")) else "ag.status"
-        return {
-            "task_shape": TaskShape.RUN_CONTROL,
-            "domain_hint": DomainHint.OPTIMIZATION,
-            "preferred_tool": preferred_tool,
-            "context_mode": _default_context_mode(state),
-            "reason": "fallback:run_control",
-            "confidence": 0.8,
-            "task": _make_task(
-                message=message,
-                attachments=attachments,
-                task_shape=TaskShape.RUN_CONTROL,
-                domain_hint=DomainHint.OPTIMIZATION,
-                preferred_tool=preferred_tool,
-                parsed_args={"run_id": state.active_run_id},
-            ),
-        }
-    if _attachment_suggests_lens(attachments) and not _message_mentions_design(msg) and not _message_mentions_optimization(msg):
+    # Run-control routing is handled by _state_sensitive_route (higher priority).
+    if attachment_suggests_lens(attachments) and not _message_mentions_design(msg) and not _message_mentions_optimization(msg):
         return {
             "task_shape": TaskShape.SINGLE_ACTION,
             "domain_hint": DomainHint.ANALYSIS,
@@ -421,7 +342,7 @@ def _fallback_route(message: str, attachments: list[dict[str, Any]], state: Deep
         }
     if _message_mentions_analysis(msg):
         return {
-            "task_shape": TaskShape.SINGLE_ACTION if _attachment_suggests_lens(attachments) or state.active_lens_ref else TaskShape.MULTI_STEP,
+            "task_shape": TaskShape.SINGLE_ACTION if attachment_suggests_lens(attachments) or state.active_lens_ref else TaskShape.MULTI_STEP,
             "domain_hint": DomainHint.ANALYSIS,
             "preferred_tool": "dl.analysis",
             "context_mode": _default_context_mode(state),
@@ -430,7 +351,7 @@ def _fallback_route(message: str, attachments: list[dict[str, Any]], state: Deep
             "task": _make_task(
                 message=message,
                 attachments=attachments,
-                task_shape=TaskShape.SINGLE_ACTION if _attachment_suggests_lens(attachments) or state.active_lens_ref else TaskShape.MULTI_STEP,
+                task_shape=TaskShape.SINGLE_ACTION if attachment_suggests_lens(attachments) or state.active_lens_ref else TaskShape.MULTI_STEP,
                 domain_hint=DomainHint.ANALYSIS,
                 preferred_tool="dl.analysis",
             ),
@@ -573,6 +494,7 @@ async def route(
     attachments: list[dict[str, Any]],
     state: DeepLensState,
     context: Any | None = None,
+    user_meta: dict[str, Any] | None = None,
 ) -> RouteResult:
     slash = apply_slash_command(message, attachments, state)
     if slash is not None:
@@ -582,7 +504,7 @@ async def route(
             "state": slash.state,
             "immediate_reply": slash.reply,
         }
-    state_override = _state_sensitive_route(message, state)
+    state_override = _state_sensitive_route(message, state, user_meta=user_meta)
     if state_override is not None:
         state_override["task"] = _apply_state_defaults(state_override["task"], state)
         return {

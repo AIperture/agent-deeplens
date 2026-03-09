@@ -5,10 +5,27 @@ import mimetypes
 from pathlib import Path
 import sys
 from typing import Any
+from urllib.parse import urlparse, unquote
 
 
 LENS_SUFFIXES = {".json", ".zmx"}
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif"}
+
+
+def _file_uri_to_path(uri: str) -> str:
+    """Convert a ``file:///`` URI to a local filesystem path.
+
+    On Windows ``file:///C:/Users/...`` becomes ``C:\\Users\\...``.
+    Non-file URIs and plain paths are returned unchanged.
+    """
+    if uri.startswith("file:///"):
+        parsed = urlparse(uri)
+        # On Windows the path starts with /C:/... – strip leading slash.
+        local = unquote(parsed.path)
+        if len(local) >= 3 and local[0] == "/" and local[2] == ":":
+            local = local[1:]
+        return local
+    return uri
 
 
 def _ensure_deeplens_importable() -> None:
@@ -20,6 +37,12 @@ def _ensure_deeplens_importable() -> None:
 
 def _import_deeplens() -> tuple[Any, Any]:
     _ensure_deeplens_importable()
+    # Force non-interactive matplotlib backend before DeepLens imports pyplot.
+    # Without this, matplotlib defaults to TkAgg which crashes with
+    # "RuntimeError: main thread is not in main loop" in async/worker threads.
+    import matplotlib
+    matplotlib.use("Agg")
+
     from deeplens import GeoLens  # type: ignore
     from deeplens.optics.geolens_pkg.utils import create_lens  # type: ignore
 
@@ -71,26 +94,35 @@ def _artifact_to_ref(artifact: Any) -> dict[str, Any]:
 async def resolve_lens_source(
     *,
     resolved_inputs: dict[str, Any],
-    task: Any,
-    state: Any,
+    task: Any = None,
+    state: Any = None,
     context: Any,
+    attachments: list[dict[str, Any]] | None = None,
+    active_source_ref: dict[str, Any] | None = None,
+    active_lens_ref: str | None = None,
 ) -> dict[str, Any]:
-    explicit = resolved_inputs.get("lens_source") or task.lens_source or {}
+    # Support both task/state objects and explicit params (for workflow calls).
+    _lens_source = (getattr(task, "lens_source", {}) if task else {})
+    _attachments = attachments or (getattr(task, "attachments", []) if task else [])
+    _active_source = active_source_ref or (getattr(state, "active_source_ref", {}) if state else {})
+    _active_lens = active_lens_ref or (getattr(state, "active_lens_ref", None) if state else None)
+
+    explicit = resolved_inputs.get("lens_source") or _lens_source or {}
     candidates: list[dict[str, Any]] = []
     if explicit:
         candidates.append(explicit)
-    candidates.extend(task.attachments or [])
-    if state.active_source_ref:
-        candidates.append(state.active_source_ref)
-    if state.active_lens_ref:
-        candidates.append({"artifact_id": state.active_lens_ref})
+    candidates.extend(_attachments or [])
+    if _active_source:
+        candidates.append(_active_source)
+    if _active_lens:
+        candidates.append({"artifact_id": _active_lens})
 
     for candidate in candidates:
         artifact_id = candidate.get("artifact_id")
         uri = candidate.get("uri") or candidate.get("url") or candidate.get("path")
         name = _candidate_name(candidate)
         if artifact_id:
-            path = await context.artifacts().as_local_file_by_id(str(artifact_id))
+            path = str(await context.artifacts().as_local_file_by_id(str(artifact_id)))
             return {"artifact_id": artifact_id, "uri": uri, "path": path, "name": name}
         if uri:
             uri_str = str(uri)
@@ -98,7 +130,7 @@ async def resolve_lens_source(
                 if _is_lens_name(name) or _is_lens_name(uri_str):
                     return {"artifact_id": artifact_id, "uri": uri_str, "path": uri_str, "name": name}
             try:
-                path = await context.artifacts().as_local_file(uri_str)
+                path = str(await context.artifacts().as_local_file(uri_str))
                 if _is_lens_name(name) or _is_lens_name(path):
                     return {"artifact_id": artifact_id, "uri": uri_str, "path": path, "name": name}
             except Exception:
@@ -113,11 +145,11 @@ async def resolve_lens_source(
         artifact_id = upload.get("artifact_id") or upload.get("uri")
         if artifact_id:
             try:
-                path = await context.artifacts().as_local_file_by_id(str(artifact_id))
+                path = str(await context.artifacts().as_local_file_by_id(str(artifact_id)))
                 return {"artifact_id": artifact_id, "uri": upload.get("uri"), "path": path, "name": name}
             except Exception:
                 if upload.get("uri") and Path(str(upload["uri"])).exists():
-                    return {"artifact_id": artifact_id, "uri": upload["uri"], "path": upload["uri"], "name": name}
+                    return {"artifact_id": artifact_id, "uri": upload["uri"], "path": str(upload["uri"]), "name": name}
 
     raise FileNotFoundError("No DeepLens .json or .zmx lens source is available.")
 
@@ -125,37 +157,34 @@ async def resolve_lens_source(
 async def load_lens(
     *,
     resolved_inputs: dict[str, Any],
-    task: Any,
-    state: Any,
+    task: Any = None,
+    state: Any = None,
     context: Any,
+    active_source_ref: dict[str, Any] | None = None,
+    active_lens_ref: str | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     source = await resolve_lens_source(
         resolved_inputs=resolved_inputs,
         task=task,
         state=state,
         context=context,
+        active_source_ref=active_source_ref,
+        active_lens_ref=active_lens_ref,
     )
     GeoLens, _create_lens = _import_deeplens()
     lens = GeoLens(filename=source["path"])
     return lens, source
 
 
-def extract_design_spec(payload: dict[str, Any]) -> dict[str, Any]:
+from .extraction import missing_design_fields  # noqa: E402
+
+
+def normalize_design_spec(payload: dict[str, Any]) -> dict[str, Any]:
+    """Apply defaults to a raw design spec payload before lens creation."""
     spec = dict(payload or {})
     spec.setdefault("save_name", "deeplens_design")
     spec.setdefault("baseline_analysis", True)
     return spec
-
-
-def missing_design_fields(spec: dict[str, Any]) -> list[str]:
-    missing: list[str] = []
-    if spec.get("fov") is None:
-        missing.append("fov")
-    if spec.get("fnum") is None:
-        missing.append("fnum")
-    if spec.get("foclen") is None and spec.get("imgh") is None:
-        missing.append("foclen_or_imgh")
-    return missing
 
 
 async def create_lens_design(
@@ -163,7 +192,7 @@ async def create_lens_design(
     resolved_inputs: dict[str, Any],
     context: Any,
 ) -> dict[str, Any]:
-    spec = extract_design_spec(resolved_inputs.get("design_spec") or {})
+    spec = normalize_design_spec(resolved_inputs.get("design_spec") or {})
     _, create_lens = _import_deeplens()
     result_dir = Path(await context.artifacts().stage_dir("_deeplens_design"))
     result_dir.mkdir(parents=True, exist_ok=True)
@@ -224,17 +253,19 @@ async def deliver_artifacts(
         uri = artifact.get("uri")
         if not uri:
             continue
-        name = artifact.get("name") or Path(str(uri)).name
+        # Convert file:/// URIs to local paths so the channel can open them.
+        local_path = _file_uri_to_path(str(uri))
+        name = artifact.get("name") or Path(local_path).name
         if Path(name).suffix.lower() in IMAGE_SUFFIXES:
             await context.channel("ui:session").send_image(
-                url=str(uri),
+                url=local_path,
                 alt=str(name),
                 title=str(name),
                 memory_log=False,
             )
         else:
             await context.channel("ui:session").send_file(
-                url=str(uri),
+                url=local_path,
                 filename=str(name),
                 title=str(name),
                 memory_log=False,
@@ -256,13 +287,11 @@ async def run_analysis(
     state: Any,
     context: Any,
 ) -> dict[str, Any]:
-    print(f"🍎 Starting DeepLens analysis with resolved inputs: {resolved_inputs}")
     use_stub = bool(resolved_inputs.get("use_stub"))
     analysis_request = dict(task.analysis_request)
     analysis_request.update(resolved_inputs.get("analysis_request") or {})
     mode = analysis_mode_from_request(analysis_request)
 
-    print(f"🍎 Running DeepLens analysis with mode: {mode}, use_stub: {use_stub}")
     if use_stub:
         summary_artifact = await context.artifacts().save_text(
             "Stub DeepLens analysis completed.",
@@ -288,7 +317,7 @@ async def run_analysis(
             context=context,
         )
     except FileNotFoundError:
-        design_spec = extract_design_spec(resolved_inputs.get("design_spec") or {})
+        design_spec = normalize_design_spec(resolved_inputs.get("design_spec") or {})
         if missing_design_fields(design_spec):
             raise
         created = await create_lens_design(

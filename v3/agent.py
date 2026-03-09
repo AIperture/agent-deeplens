@@ -8,7 +8,7 @@ from aethergraph import NodeContext, graph_fn
 from .loop_engine import run_loop
 from .memory_policy import build_context_bundle, maybe_distill_session_summary
 from .router import route
-from .types import DEBUG, TaskShape, load_state, save_state
+from .types import TaskShape, load_state, save_state
 
 
 def _roll_loop_history(state: Any) -> None:
@@ -25,6 +25,7 @@ def _roll_loop_history(state: Any) -> None:
     state.retry_counters = {}
     state.pending_action = None
     state.pending_approval = None
+    state.active_plan = None
 
 
 @graph_fn(
@@ -87,12 +88,10 @@ async def deeplens_agent(
         attachments=attachments,
         state=state,
         context=context,
+        user_meta=user_meta,
     )
     decision = route_result["decision"]
     state = route_result["state"]
-
-    # if DEBUG:
-    #     await chan.send_text(f"[DEBUG] Router decision:\n{decision}", memory_log=False)
 
     if route_result["immediate_reply"]:
         reply = route_result["immediate_reply"] or ""
@@ -123,7 +122,6 @@ async def deeplens_agent(
         reply = out["reply"]
         state = out.get("state", state)
 
-    print(f"DeepLens Agent reply: {reply}")
     await chan.send_text(reply)
     await save_state(context=context, state=state)
     return {"reply": reply}

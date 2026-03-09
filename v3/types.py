@@ -7,7 +7,6 @@ from typing import Any, Literal, TypedDict
 
 DEEPLENS_SKILL_ID = "aethergraph-agent-deeplens-v3"
 STATE_KEY = "deeplens_state_v3"
-DEBUG = True
 MISSING_FIELD_CODES = [
     "fov",
     "fnum",
@@ -53,7 +52,6 @@ class ContextMode(str, Enum):
 class ToolExecutionStyle(str, Enum):
     INLINE = "inline"
     SPAWN = "spawn"
-    SPAWN_AND_WAIT_SHORT = "spawn_and_wait_short"
 
 
 class ToolCategory(str, Enum):
@@ -115,6 +113,7 @@ class DeepLensState:
     retry_counters: dict[str, int] = field(default_factory=dict)
     loop_trace: list[dict[str, Any]] = field(default_factory=list)
     loop_history: list[dict[str, Any]] = field(default_factory=list)
+    active_plan: dict[str, Any] | None = None
     last_summary_tag: str = "session"
 
     def to_dict(self) -> dict[str, Any]:

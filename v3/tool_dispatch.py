@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any
+
+logger = logging.getLogger("ag.deeplens.v3.tool_dispatch")
 
 from .backend import (
     _artifact_to_ref,
@@ -82,6 +85,11 @@ async def _maybe_approval(spec: Any, action: dict[str, Any], state: Any, context
     if state.approved_action == spec.name:
         state.approved_action = None
         return True
+    # HARD approval is handled by the loop engine's request_approval step;
+    # reaching here means the loop already secured approval or skipped it.
+    if spec.approval_level == ApprovalLevel.HARD:
+        return True
+    # SOFT approval: prompt inline at dispatch level.
     prompt = action.get("args", {}).get("approval_prompt") or f"Approve `{spec.name}`?"
     resp = await context.channel("ui:session").ask_approval(
         prompt=prompt,
@@ -117,7 +125,6 @@ async def _resolve_inputs(
     args.setdefault("analysis_request", task.analysis_request)
     args.setdefault("run_request", task.run_request)
     args.setdefault("delivery_request", task.delivery_request)
-    print(f"🍎 Draft inputs for tool `{spec.name}` before refinement: {args}")
     return await maybe_refine_tool_inputs_with_llm(
         spec=spec,
         draft_inputs=args,
@@ -207,6 +214,13 @@ async def _exec_ag_send_file(*, resolved_inputs: dict[str, Any], context: Any, *
     return ToolResult(ok=True, summary=f"Sent file `{filename}` to the UI.")
 
 
+# Registry of input builders keyed by graph_id. Allows ag.spawn_graph to
+# work with multiple workflow types without hardcoding.
+GRAPH_INPUT_BUILDERS: dict[str, Any] = {
+    "deeplens_v3_optimize_workflow": build_optimization_inputs,
+}
+
+
 async def _exec_ag_spawn_graph(*, resolved_inputs: dict[str, Any], task: Any, state: Any, context: Any, **_: Any) -> ToolResult:
     source = None
     if resolved_inputs.get("lens_source") or task.lens_source or state.active_source_ref:
@@ -218,14 +232,16 @@ async def _exec_ag_spawn_graph(*, resolved_inputs: dict[str, Any], task: Any, st
                 context=context,
             )
         except Exception:
+            logger.warning("ag.spawn_graph: resolve_lens_source failed, using fallback", exc_info=True)
             source = task.lens_source or state.active_source_ref
 
     graph_id = str(resolved_inputs.get("graph_id") or "deeplens_v3_optimize_workflow")
-    graph_inputs = resolved_inputs.get("graph_inputs") or build_optimization_inputs(
-        resolved_inputs=resolved_inputs,
-        task=task,
-        source=source,
-        state=state,
+    # Use a registered input builder if available, otherwise pass resolved inputs directly.
+    builder = GRAPH_INPUT_BUILDERS.get(graph_id)
+    graph_inputs = resolved_inputs.get("graph_inputs") or (
+        builder(resolved_inputs=resolved_inputs, task=task, source=source, state=state)
+        if builder
+        else resolved_inputs
     )
     run_id = await context.runner().spawn_run(
         graph_id,
@@ -298,6 +314,7 @@ async def _exec_dl_load_lens(*, resolved_inputs: dict[str, Any], task: Any, stat
             context=context,
         )
     except Exception as exc:
+        logger.error("dl.load_lens failed", exc_info=True)
         return ToolResult(ok=False, summary=str(exc), status="failed")
     summary = f"Loaded lens source `{source['name']}`."
     return ToolResult(
@@ -309,7 +326,6 @@ async def _exec_dl_load_lens(*, resolved_inputs: dict[str, Any], task: Any, stat
 
 async def _exec_dl_analysis(*, resolved_inputs: dict[str, Any], task: Any, state: Any, context: Any, **_: Any) -> ToolResult:
     try:
-        print(f"🍎 Running DeepLens analysis with resolved inputs: {resolved_inputs}")
         out = await run_analysis(
             resolved_inputs=resolved_inputs,
             task=task,
@@ -317,7 +333,7 @@ async def _exec_dl_analysis(*, resolved_inputs: dict[str, Any], task: Any, state
             context=context,
         )
     except Exception as exc:
-        print(f"🍎 Error during DeepLens analysis: {exc}")
+        logger.error("dl.analysis failed", exc_info=True)
         return ToolResult(ok=False, summary=f"Analysis failed: {exc}", status="failed")
     artifact_names = ", ".join(summarize_artifacts(out["artifacts"]))
     return ToolResult(
@@ -342,11 +358,8 @@ async def _exec_dl_analysis(*, resolved_inputs: dict[str, Any], task: Any, state
 
 
 async def _exec_dl_create_lens(*, resolved_inputs: dict[str, Any], state: Any, context: Any, **_: Any) -> ToolResult:
-    print(f"🍎 Executing `dl.create_lens` with inputs: {resolved_inputs}")
     spec = resolved_inputs.get("design_spec") or {}
-    print(f"🍎 Extracted design spec for lens creation: {spec}")
     missing = missing_design_fields(spec)
-    print(f"🍎 Missing required design fields: {missing}" if missing else "🍎 All required design fields are present.")
     if missing:
         return ToolResult(
             ok=False,
@@ -354,11 +367,9 @@ async def _exec_dl_create_lens(*, resolved_inputs: dict[str, Any], state: Any, c
             status="failed",
         )
     try:
-        print(f"🍎 Creating lens design with spec: {spec}")
         created = await create_lens_design(resolved_inputs=resolved_inputs, context=context)
-        print(f"🍎 Lens design created successfully. Result: {created}")
     except Exception as exc:
-        context.logger().error(f"Error during lens creation: {exc}", exc_info=True) 
+        logger.error("dl.create_lens failed", exc_info=True)
         return ToolResult(ok=False, summary=f"Lens creation failed: {exc}", status="failed")
 
     result_dir = created["result_dir"]
@@ -407,6 +418,7 @@ async def _exec_dl_export_lens(*, resolved_inputs: dict[str, Any], task: Any, st
             context=context,
         )
     except Exception as exc:
+        logger.error("dl.export_lens failed", exc_info=True)
         return ToolResult(ok=False, summary=f"Export failed: {exc}", status="failed")
     return ToolResult(
         ok=True,
@@ -477,14 +489,22 @@ async def dispatch_tool_action(
         context_bundle=context_bundle,
         context=context,
     )
-    print(f"🍎 Dispatching tool `{tool_name}` with resolved inputs: {resolved_inputs}")
-    result = await EXECUTOR_MAP[spec.executor_key](
-        resolved_inputs=resolved_inputs,
-        task=task,
-        state=state,
-        context_bundle=context_bundle,
-        context=context,
-    )
+    try:
+        result = await EXECUTOR_MAP[spec.executor_key](
+            resolved_inputs=resolved_inputs,
+            task=task,
+            state=state,
+            context_bundle=context_bundle,
+            context=context,
+        )
+    except Exception as exc:
+        logger.error("Unhandled error in tool executor %s", tool_name, exc_info=True)
+        result = ToolResult(
+            ok=False,
+            summary=f"`{tool_name}` failed: {exc}",
+            status="failed",
+            error_code="unhandled_executor_error",
+        )
     if result.artifacts:
         _append_artifacts(state, result.artifacts)
     _apply_state_updates(state, result)
