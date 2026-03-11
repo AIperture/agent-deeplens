@@ -32,7 +32,7 @@ def build_response_frame(
         agenda_status=agenda_status,
         completed_actions=completed_actions,
         pending_actions=pending_actions,
-        missing_fields=list((state.active_intent or {}).get("missing_fields", [])) if isinstance(state.active_intent, dict) else [],
+        missing_fields=list(state.runtime_missing_fields or []) or (list((state.active_intent or {}).get("missing_fields", [])) if isinstance(state.active_intent, dict) else []),
         approval_prompt=approval_prompt,
         last_tool_summary=last_tool_result.summary if last_tool_result is not None else None,
         next_action_hints=list(state.next_action_hints),

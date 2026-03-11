@@ -16,6 +16,7 @@ def _schema() -> dict[str, Any]:
             "decision_kind": {"type": "string", "enum": ["retry_action", "replace_remaining_agenda", "ask_user", "escalate", "fail"]},
             "reason": {"type": "string"},
             "updated_task_patch_json": {"type": "string"},
+            "retry_patch_json": {"type": "string"},
             "replacement_actions": {
                 "type": "array",
                 "items": {
@@ -33,7 +34,7 @@ def _schema() -> dict[str, Any]:
             "ask_user_prompt": {"type": ["string", "null"]},
             "escalate_reason": {"type": ["string", "null"]},
         },
-        "required": ["decision_kind", "reason", "updated_task_patch_json", "replacement_actions", "ask_user_prompt", "escalate_reason"],
+        "required": ["decision_kind", "reason", "updated_task_patch_json", "retry_patch_json", "replacement_actions", "ask_user_prompt", "escalate_reason"],
         "additionalProperties": False,
     }
 
@@ -65,6 +66,15 @@ def _decode_actions(items: list[dict[str, Any]]) -> list[AgendaAction]:
             args["approval_prompt" if item.get("kind") == "request_approval" else "prompt"] = prompt
         actions.append(_mk_action(idx, str(item.get("kind") or "fail"), name, args=args, rationale=str(item.get("rationale") or "")))
     return actions
+
+
+def _apply_retry_patch(action: AgendaAction, retry_patch: dict[str, Any]) -> AgendaAction:
+    patched = deepcopy(action)
+    if isinstance(retry_patch, dict) and retry_patch:
+        merged = dict(action.args)
+        merged.update(retry_patch)
+        patched.args = merged
+    return patched
 
 
 async def llm_replan_after_failure(
@@ -101,6 +111,8 @@ async def llm_replan_after_failure(
             "dependency_failures": result.dependency_failures,
             "diagnostics": result.diagnostics,
         },
+        "last_attempt": state.last_attempt,
+        "failure_history_tail": state.failure_history[-4:],
         "working_state": context_bundle.working_state,
         "completed_actions": [action.name or action.kind for action in agenda.actions if action.status.value == "completed"],
         "allowed_tools": list(TOOL_REGISTRY.keys()),
@@ -141,17 +153,27 @@ async def llm_replan_after_failure(
         task_patch = json.loads(obj.get("updated_task_patch_json") or "{}")
     except Exception:
         task_patch = {}
+    try:
+        retry_patch = json.loads(obj.get("retry_patch_json") or "{}")
+    except Exception:
+        retry_patch = {}
     patched_task = _apply_task_patch(task, task_patch if isinstance(task_patch, dict) else {})
     decision_kind = RecoveryDecisionKind(str(obj.get("decision_kind") or "fail"))
     replacement_actions = _decode_actions(list(obj.get("replacement_actions") or []))
 
     if decision_kind == RecoveryDecisionKind.RETRY_ACTION:
-        retry_action = replacement_actions[0] if replacement_actions else None
-        return RecoveryDecision(kind=decision_kind, reason=str(obj.get("reason") or "Retry the failed action with a patched input set."), action=retry_action, task=patched_task)
+        retry_action = _apply_retry_patch(failed_action, retry_patch if isinstance(retry_patch, dict) else {})
+        return RecoveryDecision(
+            kind=decision_kind,
+            reason=str(obj.get("reason") or "Retry the failed action with a patched input set."),
+            action=retry_action,
+            task=patched_task,
+            retry_patch=retry_patch if isinstance(retry_patch, dict) else {},
+        )
     if decision_kind == RecoveryDecisionKind.REPLACE_REMAINING_AGENDA:
-        return RecoveryDecision(kind=decision_kind, reason=str(obj.get("reason") or "Replace the remaining agenda after the failure."), replacement_actions=replacement_actions, task=patched_task)
+        return RecoveryDecision(kind=decision_kind, reason=str(obj.get("reason") or "Replace the remaining agenda after the failure."), replacement_actions=replacement_actions, task=patched_task, replacement_reason=str(obj.get("reason") or "Replace the remaining agenda after the failure."))
     if decision_kind == RecoveryDecisionKind.ASK_USER:
         return RecoveryDecision(kind=decision_kind, reason=str(obj.get("reason") or "Need a narrower clarification to continue."), ask_user_prompt=str(obj.get("ask_user_prompt") or ""), task=patched_task, outcome_kind=ResponseOutcomeKind.WAITING)
     if decision_kind == RecoveryDecisionKind.ESCALATE:
-        return RecoveryDecision(kind=decision_kind, reason=str(obj.get("escalate_reason") or obj.get("reason") or "Need human assistance to proceed."), task=patched_task, outcome_kind=ResponseOutcomeKind.ESCALATE)
-    return RecoveryDecision(kind=RecoveryDecisionKind.FAIL, reason=str(obj.get("reason") or "The failed action could not be recovered safely."), task=patched_task, outcome_kind=ResponseOutcomeKind.FAILED)
+        return RecoveryDecision(kind=decision_kind, reason=str(obj.get("escalate_reason") or obj.get("reason") or "Need human assistance to proceed."), task=patched_task, outcome_kind=ResponseOutcomeKind.ESCALATE, escalation_diagnostics_ref=str((state.last_attempt or {}).get("attempt_id") or ""))
+    return RecoveryDecision(kind=RecoveryDecisionKind.FAIL, reason=str(obj.get("reason") or "The failed action could not be recovered safely."), task=patched_task, outcome_kind=ResponseOutcomeKind.FAILED, escalation_diagnostics_ref=str((state.last_attempt or {}).get("attempt_id") or ""))

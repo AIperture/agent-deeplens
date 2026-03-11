@@ -8,6 +8,9 @@ from .llm_replanner import llm_replan_after_failure
 
 
 def _failure_signature(failed_action: Any, result: Any) -> str:
+    diagnostics = getattr(result, "diagnostics", {}) or {}
+    if diagnostics.get("failure_signature"):
+        return str(diagnostics["failure_signature"])
     return "|".join(
         [
             str(failed_action.name or failed_action.kind),
@@ -71,4 +74,5 @@ async def recover_failed_action(
         reason=reason,
         task=task,
         outcome_kind=ResponseOutcomeKind.ESCALATE,
+        escalation_diagnostics_ref=str((state.last_attempt or {}).get("attempt_id") or ""),
     )

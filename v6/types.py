@@ -283,8 +283,13 @@ class DeepLensState:
     recovery_attempts: dict[str, int] = field(default_factory=dict)
     loop_trace: list[dict[str, Any]] = field(default_factory=list)
     loop_history: list[dict[str, Any]] = field(default_factory=list)
+    last_attempt: dict[str, Any] | None = None
+    attempt_history: list[dict[str, Any]] = field(default_factory=list)
     last_tool_result: dict[str, Any] = field(default_factory=dict)
     failure_history: list[dict[str, Any]] = field(default_factory=list)
+    runtime_missing_fields: list[str] = field(default_factory=list)
+    runtime_invalid_fields: dict[str, str] = field(default_factory=dict)
+    last_prompt_reason: str | None = None
     last_replan_reason: str | None = None
     active_recovery: dict[str, Any] | None = None
     last_summary_tag: str = "session"
@@ -329,6 +334,7 @@ class ToolResult:
     summary: str
     status: str = "completed"
     tool_name: str | None = None
+    attempt_id: str | None = None
     data: dict[str, Any] = field(default_factory=dict)
     artifacts: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -364,6 +370,22 @@ class ResponseFrame:
 
 
 @dataclass
+class ActionAttempt:
+    attempt_id: str
+    action_id: str
+    tool_name: str
+    resolved_inputs: dict[str, Any] = field(default_factory=dict)
+    invalid_fields: dict[str, str] = field(default_factory=dict)
+    validation_error: str | None = None
+    attempt_index: int = 1
+    failure_signature: str | None = None
+    result: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class RecoveryDecision:
     kind: RecoveryDecisionKind
     reason: str
@@ -372,6 +394,9 @@ class RecoveryDecision:
     ask_user_prompt: str | None = None
     task: DeepLensTask | None = None
     outcome_kind: ResponseOutcomeKind | None = None
+    retry_patch: dict[str, Any] = field(default_factory=dict)
+    replacement_reason: str | None = None
+    escalation_diagnostics_ref: str | None = None
 
 
 ROUTER_JSON_SCHEMA: dict[str, Any] = {

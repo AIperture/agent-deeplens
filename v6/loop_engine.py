@@ -173,7 +173,7 @@ async def run_loop(
             )
 
             if action.kind == "ask_user":
-                prompt = action.args.get("prompt") or build_missing_prompt(task)
+                prompt = action.args.get("prompt") or build_missing_prompt(task, state)
                 action.status = AgendaActionStatus.BLOCKED
                 agenda.status = AgendaStatus.WAITING
                 await _emit_loop_update(
@@ -206,6 +206,9 @@ async def run_loop(
                 )
                 state.pending_action = None
                 state.next_action_hints = []
+                state.runtime_missing_fields = []
+                state.runtime_invalid_fields = {}
+                state.last_prompt_reason = None
                 context_bundle = await _refresh_loop_context(task, state, context, context_mode, agenda)
                 agenda = await build_action_agenda(task=task, state=state, context_bundle=context_bundle, context=context)
                 continue
@@ -265,6 +268,7 @@ async def run_loop(
                 await _save_loop_state(task, state, context, agenda)
                 result = await dispatch_tool_action(
                     action={
+                        "action_id": action.action_id,
                         "kind": action.kind,
                         "name": action.name,
                         "args": action.args,
@@ -362,6 +366,9 @@ async def run_loop(
                 if recovery.kind == RecoveryDecisionKind.REPLACE_REMAINING_AGENDA:
                     replace_pending_tail(agenda, recovery.replacement_actions)
                     state.last_replan_reason = recovery.reason
+                    state.runtime_missing_fields = []
+                    state.runtime_invalid_fields = {}
+                    state.last_prompt_reason = None
                     await _emit_loop_update(
                         chan,
                         phase="execution.step",
@@ -378,7 +385,7 @@ async def run_loop(
                     continue
                 if recovery.kind == RecoveryDecisionKind.ASK_USER:
                     result_out = {
-                        "reply": recovery.ask_user_prompt or build_missing_prompt(task),
+                        "reply": recovery.ask_user_prompt or build_missing_prompt(task, state),
                         "state": state,
                         "outcome_kind": ResponseOutcomeKind.WAITING,
                         "last_tool_result": result,

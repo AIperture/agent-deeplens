@@ -289,8 +289,14 @@ def compute_missing_fields(task: DeepLensTask) -> list[str]:
     return list(dict.fromkeys(missing))
 
 
-def build_missing_prompt(task: DeepLensTask) -> str:
-    missing = compute_missing_fields(task)
+def build_missing_prompt(task: DeepLensTask, state: DeepLensState | None = None) -> str:
+    runtime_invalid = dict(getattr(state, "runtime_invalid_fields", {}) or {}) if state is not None else {}
+    if runtime_invalid:
+        labels = ", ".join(f"`{name.split('.')[-1]}`" for name in runtime_invalid)
+        return f"I found invalid values that need to be corrected before I can continue: {labels}."
+
+    runtime_missing = list(getattr(state, "runtime_missing_fields", []) or []) if state is not None else []
+    missing = runtime_missing or compute_missing_fields(task)
     if not missing:
         return "Please provide the missing information so I can continue."
     joined = ", ".join(field_prompt_fragment(name) for name in missing)
