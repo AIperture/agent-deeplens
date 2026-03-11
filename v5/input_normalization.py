@@ -1,230 +1,128 @@
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass, field
 from typing import Any
 
-from .state import set_active_task
-from .types import (
-    ConversationState,
-    DomainHint,
-    OutcomeType,
-    TaskFrame,
-    TaskStatus,
-    ToolResult,
-)
+from .types import ConversationState, PendingInteraction, TaskFrame, TurnEnvelope
 
 
-# ---------------------------------------------------------------------
-# What to implement here
-# ---------------------------------------------------------------------
-# - Normalize raw tool outputs into ToolResult
-# - Apply successful tool outputs back into task/state
-# - Merge run/artifact/source refs in one place
-#
-# What should NOT be included here
-# - Task interpretation
-# - Broad repair logic
-# - Multi-step control logic
-# ---------------------------------------------------------------------
+@dataclass
+class PreInterpretationContext:
+    active_task_summary: dict[str, Any] = field(default_factory=dict)
+    pending_interaction: dict[str, Any] = field(default_factory=dict)
+    recent_turns: list[dict[str, Any]] = field(default_factory=list)
+    active_refs: list[str] = field(default_factory=list)
+    last_result_summary: str | None = None
 
 
-def _coerce_outcome_type(raw: Any, ok: bool, needs_input: bool) -> OutcomeType:
-    if isinstance(raw, OutcomeType):
-        return raw
-
-    if isinstance(raw, str):
-        lowered = raw.lower().strip()
-        for candidate in OutcomeType:
-            if lowered == candidate.value:
-                return candidate
-
-    if needs_input:
-        return OutcomeType.NEEDS_INPUT
-
-    return OutcomeType.SUCCESS if ok else OutcomeType.FAILED
+_EXPLICIT_COMMAND_RE = re.compile(r"^\s*(/[a-z0-9_:-]+(?:\s+[a-z0-9_:-]+)?)", re.IGNORECASE)
 
 
-def _dict_get(raw: Any, key: str, default: Any = None) -> Any:
-    if isinstance(raw, dict):
-        return raw.get(key, default)
-    return getattr(raw, key, default)
+def _detect_attachment_kind(item: dict[str, Any]) -> str:
+    name = str(item.get("name") or item.get("filename") or item.get("uri") or "").lower()
+    if any(name.endswith(suffix) for suffix in (".json", ".zmx")):
+        return "lens"
+    if any(name.endswith(suffix) for suffix in (".png", ".jpg", ".jpeg", ".webp")):
+        return "image"
+    return str(item.get("kind") or "file")
 
 
-def normalize_tool_result(raw_result: Any, *, tool_name: str) -> ToolResult:
-    """
-    Accept a broad variety of raw tool-return shapes.
-
-    Supported patterns:
-    - already-normalized ToolResult
-    - dict-like payload
-    - object with matching attributes
-    """
-    if isinstance(raw_result, ToolResult):
-        return raw_result
-
-    ok = bool(_dict_get(raw_result, "ok", False))
-    summary = _dict_get(raw_result, "summary", "") or _dict_get(raw_result, "message", "") or ""
-    needs_input = bool(_dict_get(raw_result, "needs_input", False))
-    missing_fields = list(_dict_get(raw_result, "missing_fields", []) or [])
-    outcome_type = _coerce_outcome_type(
-        _dict_get(raw_result, "outcome_type", None),
-        ok=ok,
-        needs_input=needs_input,
-    )
-
-    return ToolResult(
-        ok=ok,
-        tool_name=_dict_get(raw_result, "tool_name", tool_name) or tool_name,
-        summary=summary or ("Completed successfully." if ok else "The tool call failed."),
-        outcome_type=outcome_type,
-        status=_dict_get(raw_result, "status", "completed"),
-        data=dict(_dict_get(raw_result, "data", {}) or {}),
-        artifacts=list(_dict_get(raw_result, "artifacts", []) or []),
-        warnings=list(_dict_get(raw_result, "warnings", []) or []),
-        error_code=_dict_get(raw_result, "error_code", None),
-        retryable=bool(_dict_get(raw_result, "retryable", False)),
-        run_id=_dict_get(raw_result, "run_id", None),
-        needs_input=needs_input,
-        missing_fields=missing_fields,
-        state_updates=dict(_dict_get(raw_result, "state_updates", {}) or {}),
-        recommended_next_actions=list(_dict_get(raw_result, "recommended_next_actions", []) or []),
-        user_visible_summary=_dict_get(raw_result, "user_visible_summary", None),
-        should_end_turn=bool(_dict_get(raw_result, "should_end_turn", False)),
-        raw_status=_dict_get(raw_result, "raw_status", None),
-    )
+def _normalize_attachments(attachments: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in attachments or []:
+        if not isinstance(item, dict):
+            continue
+        out = dict(item)
+        out.setdefault("kind", _detect_attachment_kind(out))
+        normalized.append(out)
+    return normalized
 
 
-def _apply_run_updates(result: ToolResult, state: ConversationState, task: TaskFrame) -> None:
-    if result.run_id:
-        state.active_run_id = result.run_id
-        task.run_request["run_id"] = result.run_id
-
-    run_update = result.state_updates.get("run") if result.state_updates else None
-    if isinstance(run_update, dict) and run_update.get("run_id"):
-        state.active_run_id = run_update["run_id"]
-        task.run_request["run_id"] = run_update["run_id"]
+def _extract_explicit_command(message: str) -> str | None:
+    match = _EXPLICIT_COMMAND_RE.match(message or "")
+    if not match:
+        return None
+    return match.group(1).strip().lower()
 
 
-def _apply_artifact_updates(result: ToolResult, state: ConversationState, task: TaskFrame) -> None:
-    if result.artifacts:
-        state.last_artifacts.extend(result.artifacts)
-        state.last_artifacts = state.last_artifacts[-20:]
-
-        task.active_artifact_refs.extend(
-            [
-                a.get("artifact_id") or a.get("uri") or a.get("name")
-                for a in result.artifacts
-                if a.get("artifact_id") or a.get("uri") or a.get("name")
-            ]
-        )
-        task.active_artifact_refs = task.active_artifact_refs[-20:]
-
-    artifact_update = result.state_updates.get("artifacts") if result.state_updates else None
-    if isinstance(artifact_update, list):
-        state.last_artifacts.extend(artifact_update)
-        state.last_artifacts = state.last_artifacts[-20:]
+def _task_summary(task: TaskFrame | None) -> dict[str, Any]:
+    if task is None:
+        return {}
+    return {
+        "task_id": task.task_id,
+        "domain_hint": task.domain_hint.value,
+        "task_shape": task.task_shape.value,
+        "preferred_tool": task.preferred_tool,
+        "missing_fields": list(task.missing_fields),
+        "status": task.status.value,
+        "goal": task.user_goal,
+    }
 
 
-def _apply_source_updates(result: ToolResult, state: ConversationState, task: TaskFrame) -> None:
-    source_ref = None
-
-    if result.state_updates:
-        source_ref = result.state_updates.get("active_source_ref")
-
-    if not source_ref and result.data:
-        source_ref = result.data.get("lens_source") or result.data.get("source_ref")
-
-    if isinstance(source_ref, dict) and source_ref:
-        state.active_source_ref = dict(source_ref)
-        task.lens_source = dict(source_ref)
-
-
-def _apply_design_updates(result: ToolResult, state: ConversationState, task: TaskFrame) -> None:
-    design_spec = None
-
-    if result.state_updates:
-        design_spec = result.state_updates.get("design_spec")
-
-    if not design_spec and result.data:
-        design_spec = result.data.get("design_spec")
-
-    if isinstance(design_spec, dict) and design_spec:
-        task.design_spec.update(design_spec)
-        state.design_draft.update(design_spec)
-
-    # If create_lens succeeded and returned a lens artifact/source, keep task alive
-    # for follow-up analysis/export/optimization.
-    if result.ok and task.domain_hint == DomainHint.DESIGN:
-        task.status = TaskStatus.ACTIVE
-
-
-def _apply_analysis_updates(result: ToolResult, state: ConversationState, task: TaskFrame) -> None:
-    analysis_data = None
-
-    if result.state_updates:
-        analysis_data = result.state_updates.get("analysis")
-
-    if not analysis_data and result.data:
-        analysis_data = result.data.get("analysis")
-
-    if isinstance(analysis_data, dict) and analysis_data:
-        # Store compact summary only in persistent state.
-        summary = analysis_data.get("summary") or result.summary
-        if summary:
-            state.last_result_summary = summary
-
-    if result.ok and task.domain_hint == DomainHint.ANALYSIS:
-        task.status = TaskStatus.COMPLETED if result.should_end_turn else TaskStatus.ACTIVE
-
-
-def _apply_export_updates(result: ToolResult, state: ConversationState, task: TaskFrame) -> None:
-    del state
-    if result.ok and task.domain_hint == DomainHint.EXPORT:
-        task.status = TaskStatus.COMPLETED if result.should_end_turn else TaskStatus.ACTIVE
-
-
-def _apply_run_control_updates(result: ToolResult, state: ConversationState, task: TaskFrame) -> None:
-    del task
-    if result.state_updates:
-        run_status = result.state_updates.get("run_status")
-        if isinstance(run_status, str) and run_status in {"cancelled", "finished", "completed", "failed"}:
-            if run_status in {"cancelled", "finished", "completed", "failed"}:
-                state.active_run_id = None
-
-
-def apply_tool_result_to_state(
+async def build_preinterpretation_context(
     *,
-    result: ToolResult,
     state: ConversationState,
-    task: TaskFrame,
-) -> None:
-    """
-    Apply successful tool observations back into task/state.
+    context: Any,
+) -> PreInterpretationContext:
+    recent_turns: list[dict[str, Any]] = []
+    try:
+        recent_turns = await context.memory().recent_chat(
+            limit=8,
+            roles=["user", "assistant"],
+            include_tags=False,
+            include_ts=False,
+            level="session",
+            use_persistence=False,
+        )
+    except Exception:
+        context.logger().warning("deeplens_v5: recent_chat lookup failed", exc_info=True)
 
-    This function should stay relatively dumb:
-    - merge refs
-    - merge returned structured data
-    - update status
+    active_task = state.get_active_task()
+    pending = state.get_pending_interaction()
+    refs: list[str] = []
+    if state.active_source_ref:
+        refs.append(str(state.active_source_ref.get("artifact_id") or state.active_source_ref.get("uri") or state.active_source_ref.get("name")))
+    if state.active_run_id:
+        refs.append(f"run:{state.active_run_id}")
+    refs.extend(
+        [
+            str(item.get("artifact_id") or item.get("uri") or item.get("name"))
+            for item in state.last_artifacts[-4:]
+            if item.get("artifact_id") or item.get("uri") or item.get("name")
+        ]
+    )
+    return PreInterpretationContext(
+        active_task_summary=_task_summary(active_task),
+        pending_interaction=pending.to_dict() if pending else {},
+        recent_turns=recent_turns[-8:],
+        active_refs=refs[:8],
+        last_result_summary=state.last_result_summary,
+    )
 
-    It should not decide the next action.
-    """
-    if not result.ok:
-        return
 
-    _apply_run_updates(result, state, task)
-    _apply_artifact_updates(result, state, task)
-    _apply_source_updates(result, state, task)
-    _apply_design_updates(result, state, task)
-    _apply_analysis_updates(result, state, task)
-    _apply_export_updates(result, state, task)
-    _apply_run_control_updates(result, state, task)
-
-    if result.summary:
-        state.last_result_summary = result.summary
-
-    # Generic status handling
-    if result.outcome_type == OutcomeType.RUN_SUBMITTED:
-        task.status = TaskStatus.RUNNING
-    elif result.outcome_type == OutcomeType.SUCCESS and task.status not in {TaskStatus.COMPLETED, TaskStatus.RUNNING}:
-        task.status = TaskStatus.ACTIVE
-
-    set_active_task(state, task)
+def normalize_turn(
+    *,
+    message: str,
+    attachments: list[dict[str, Any]] | None,
+    state: ConversationState,
+    user_meta: dict[str, Any] | None = None,
+) -> TurnEnvelope:
+    cleaned = (message or "").strip()
+    normalized_attachments = _normalize_attachments(attachments)
+    active_refs: list[str] = []
+    if state.active_source_ref:
+        active_refs.append(str(state.active_source_ref.get("artifact_id") or state.active_source_ref.get("uri") or state.active_source_ref.get("name")))
+    if state.active_run_id:
+        active_refs.append(f"run:{state.active_run_id}")
+    return TurnEnvelope(
+        raw_message=message or "",
+        cleaned_message=cleaned,
+        attachments=normalized_attachments,
+        explicit_command=_extract_explicit_command(cleaned),
+        ui_hints={},
+        user_meta=dict(user_meta or {}),
+        active_refs=active_refs,
+        active_source_ref=dict(state.active_source_ref or {}),
+        active_run_id=state.active_run_id,
+    )

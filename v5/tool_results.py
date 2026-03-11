@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .state import set_active_task
+from .state import set_active_task, set_next_action_hints
 from .types import (
     ConversationState,
     DomainHint,
@@ -138,6 +138,17 @@ def _apply_source_updates(result: ToolResult, state: ConversationState, task: Ta
         task.lens_source = dict(source_ref)
 
 
+def _apply_explicit_state_updates(result: ToolResult, state: ConversationState) -> None:
+    updates = dict(result.state_updates or {})
+    if isinstance(result.data, dict):
+        nested_updates = result.data.get("state_updates")
+        if isinstance(nested_updates, dict):
+            updates.update(nested_updates)
+    for key, value in updates.items():
+        if value is not None and hasattr(state, key):
+            setattr(state, key, value)
+
+
 def _apply_design_updates(result: ToolResult, state: ConversationState, task: TaskFrame) -> None:
     design_spec = None
 
@@ -213,6 +224,7 @@ def apply_tool_result_to_state(
     _apply_run_updates(result, state, task)
     _apply_artifact_updates(result, state, task)
     _apply_source_updates(result, state, task)
+    _apply_explicit_state_updates(result, state)
     _apply_design_updates(result, state, task)
     _apply_analysis_updates(result, state, task)
     _apply_export_updates(result, state, task)
@@ -220,6 +232,7 @@ def apply_tool_result_to_state(
 
     if result.summary:
         state.last_result_summary = result.summary
+    set_next_action_hints(state, result.recommended_next_actions)
 
     # Generic status handling
     if result.outcome_type == OutcomeType.RUN_SUBMITTED:

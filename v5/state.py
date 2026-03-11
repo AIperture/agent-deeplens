@@ -37,3 +37,7 @@ def reset_retry(state: ConversationState, key: str) -> None:
 
 def update_last_result_summary(state: ConversationState, summary: str | None) -> None:
     state.last_result_summary = summary or state.last_result_summary
+
+
+def set_next_action_hints(state: ConversationState, hints: list[str] | None) -> None:
+    state.next_action_hints = list(hints or [])[:6]

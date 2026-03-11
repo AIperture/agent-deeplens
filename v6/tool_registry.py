@@ -31,7 +31,10 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         execution_style=ToolExecutionStyle.INLINE,
         executor_key="ag.get_latest_uploads",
         description="Inspect the latest uploaded files available in the session channel.",
-        argument_hints={"inputs": [], "returns": ["uploads", "names"]},
+        argument_hints={
+            "inputs": [],
+            "returns": ["uploads", "names"],
+        },
     ),
     "ag.load_artifact_text_or_json": ToolSpec(
         name="ag.load_artifact_text_or_json",
@@ -39,7 +42,10 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         execution_style=ToolExecutionStyle.INLINE,
         executor_key="ag.load_artifact_text_or_json",
         description="Load a text or JSON artifact by id or uri.",
-        argument_hints={"inputs": ["artifact_id or uri"], "returns": ["payload"]},
+        argument_hints={
+            "inputs": ["artifact_id or uri"],
+            "returns": ["payload"],
+        },
     ),
     "ag.save_text_artifact": ToolSpec(
         name="ag.save_text_artifact",
@@ -49,7 +55,10 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         description="Persist a text payload as an artifact.",
         writes_artifacts=True,
         produces_artifacts=True,
-        argument_hints={"inputs": ["payload", "name"], "returns": ["artifact_id"]},
+        argument_hints={
+            "inputs": ["payload", "name"],
+            "returns": ["artifact_id"],
+        },
     ),
     "ag.save_json_artifact": ToolSpec(
         name="ag.save_json_artifact",
@@ -59,7 +68,10 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         description="Persist a JSON payload as an artifact.",
         writes_artifacts=True,
         produces_artifacts=True,
-        argument_hints={"inputs": ["payload", "name"], "returns": ["artifact_id"]},
+        argument_hints={
+            "inputs": ["payload", "name"],
+            "returns": ["artifact_id"],
+        },
     ),
     "ag.send_image": ToolSpec(
         name="ag.send_image",
@@ -68,7 +80,9 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         executor_key="ag.send_image",
         description="Send an image artifact or file to the UI.",
         default_delivery="image",
-        argument_hints={"inputs": ["url or uri", "title"]},
+        argument_hints={
+            "inputs": ["url or uri", "title"],
+        },
     ),
     "ag.send_file": ToolSpec(
         name="ag.send_file",
@@ -77,7 +91,9 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         executor_key="ag.send_file",
         description="Send a file artifact or local file to the UI.",
         default_delivery="file",
-        argument_hints={"inputs": ["url or uri", "filename", "title"]},
+        argument_hints={
+            "inputs": ["url or uri", "filename", "title"],
+        },
     ),
     "ag.spawn_graph": ToolSpec(
         name="ag.spawn_graph",
@@ -100,7 +116,7 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
                 "run_request.export_formats",
             ],
             "defaults": {
-                "graph_id": "deeplens_v3_optimize_workflow",
+                "graph_id": "deeplens_v6_optimize_workflow",
                 "iterations": 500,
                 "checkpoint_every": 100,
                 "export_formats": ["json", "zmx"],
@@ -113,7 +129,10 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         execution_style=ToolExecutionStyle.INLINE,
         executor_key="ag.status",
         description="Check a child run and summarize its current status.",
-        argument_hints={"inputs": ["run_id", "timeout_s"], "defaults": {"timeout_s": 1}},
+        argument_hints={
+            "inputs": ["run_id", "timeout_s"],
+            "defaults": {"timeout_s": 1},
+        },
     ),
     "ag.cancel": ToolSpec(
         name="ag.cancel",
@@ -122,7 +141,9 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         approval_level=ApprovalLevel.SOFT,
         executor_key="ag.cancel",
         description="Best-effort cancel a child run.",
-        argument_hints={"inputs": ["run_id"]},
+        argument_hints={
+            "inputs": ["run_id"],
+        },
     ),
     "dl.load_lens": ToolSpec(
         name="dl.load_lens",
@@ -131,7 +152,9 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         executor_key="dl.load_lens",
         description="Resolve a lens file or artifact and make it the active lens.",
         requires_lens_input=True,
-        argument_hints={"inputs": ["lens_source"]},
+        argument_hints={
+            "inputs": ["lens_source"],
+        },
     ),
     "dl.analysis": ToolSpec(
         name="dl.analysis",
@@ -192,7 +215,10 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         requires_lens_input=True,
         produces_artifacts=True,
         default_delivery="summary_plus_files",
-        argument_hints={"inputs": ["lens_source", "formats"], "defaults": {"formats": ["json", "zmx"]}},
+        argument_hints={
+            "inputs": ["lens_source", "formats"],
+            "defaults": {"formats": ["json", "zmx"]},
+        },
     ),
 }
 

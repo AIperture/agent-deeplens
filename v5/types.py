@@ -37,6 +37,11 @@ class DomainHint(str, Enum):
     UNKNOWN = "unknown"
 
 
+class ContextMode(str, Enum):
+    LITE = "lite"
+    FULL = "full"
+
+
 class TaskShape(str, Enum):
     DIRECT_ANSWER = "direct_answer"
     SINGLE_ACTION = "single_action"
@@ -66,6 +71,22 @@ class FieldSource(str, Enum):
     LLM = "llm"
     DEFAULT = "default"
     TOOL = "tool"
+
+
+class ToolExecutionStyle(str, Enum):
+    INLINE = "inline"
+    SPAWN = "spawn"
+
+
+class ToolCategory(str, Enum):
+    AG = "ag"
+    DEEPLENS = "deeplens"
+
+
+class ApprovalLevel(str, Enum):
+    NONE = "none"
+    SOFT = "soft"
+    HARD = "hard"
 
 
 class PendingInteractionKind(str, Enum):
@@ -186,6 +207,7 @@ class TaskFrame:
     delivery_request: dict[str, Any] = field(default_factory=dict)
 
     # Refs / sources
+    attachments: list[dict[str, Any]] = field(default_factory=list)
     source_refs: list[dict[str, Any]] = field(default_factory=list)
     active_artifact_refs: list[str] = field(default_factory=list)
     lens_source: dict[str, Any] = field(default_factory=dict)
@@ -214,6 +236,7 @@ class TaskFrame:
             analysis_request=dict(raw.get("analysis_request", {})),
             run_request=dict(raw.get("run_request", {})),
             delivery_request=dict(raw.get("delivery_request", {})),
+            attachments=list(raw.get("attachments", [])),
             source_refs=list(raw.get("source_refs", [])),
             active_artifact_refs=list(raw.get("active_artifact_refs", [])),
             lens_source=dict(raw.get("lens_source", {})),
@@ -323,17 +346,30 @@ class InterpreterDecision:
 @dataclass
 class ConversationState:
     # Keep persistent runtime state small.
+    context_mode: str = "lite"
     active_task: dict[str, Any] | None = None
     pending_interaction: dict[str, Any] | None = None
 
     active_run_id: str | None = None
+    pending_runs: list[dict[str, Any]] = field(default_factory=list)
+    active_lens_ref: str | None = None
     active_source_ref: dict[str, Any] = field(default_factory=dict)
+    last_metrics: dict[str, Any] = field(default_factory=dict)
     last_artifacts: list[dict[str, Any]] = field(default_factory=list)
+    last_analysis_bundle: dict[str, Any] = field(default_factory=dict)
     design_draft: dict[str, Any] = field(default_factory=dict)
     last_result_summary: str | None = None
+    next_action_hints: list[str] = field(default_factory=list)
+    last_user_turn: str | None = None
+    requested_next_step: str | None = None
+    pending_action: str | None = None
+    pending_approval: dict[str, Any] | None = None
+    approved_action: str | None = None
 
     retry_counters: dict[str, int] = field(default_factory=dict)
     loop_trace: list[dict[str, Any]] = field(default_factory=list)
+    loop_history: list[dict[str, Any]] = field(default_factory=list)
+    active_plan: dict[str, Any] | None = None
 
     last_summary_tag: str = "session"
 
