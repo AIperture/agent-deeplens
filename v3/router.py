@@ -306,6 +306,11 @@ def _message_mentions_optimization(msg: str) -> bool:
 
 
 def _fallback_route(message: str, attachments: list[dict[str, Any]], state: DeepLensState) -> RouteDecision:
+    """
+    A deterministic fallback routing based on simple heuristics, used when no slash command or state-sensitive route is triggered.
+    This is a safety net to ensure that user requests are routed somewhere reasonable, and also serves as a source of weak signals for the LLM router to learn from.
+    The heuristics are intentionally simple and high-precision, to avoid misrouting. The LLM router can be used to capture more complex patterns and edge cases.
+    """
     msg = (message or "").lower()
     # Run-control routing is handled by _state_sensitive_route (higher priority).
     if attachment_suggests_lens(attachments) and not _message_mentions_design(msg) and not _message_mentions_optimization(msg):
