@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 
-from .extraction import build_missing_prompt, compute_missing_fields
-from .types import (
+from ..extraction import build_missing_prompt, compute_missing_fields
+from ..types import (
     DEEPLENS_SKILL_ID,
     ActionAgenda,
     AgendaAction,
@@ -136,9 +135,7 @@ def _deterministic_actions(task: DeepLensTask, intent: IntentFrame) -> list[Agen
             actions.append(_mk_action(idx, "tool_call", tool_name, rationale="Run-control tool is explicit."))
             idx += 1
 
-    if not actions:
-        return []
-    if actions[-1].kind != "tool_call" or actions[-1].name not in {"ag.spawn_graph"}:
+    if actions and (actions[-1].kind != "tool_call" or actions[-1].name not in {"ag.spawn_graph"}):
         actions.append(_mk_action(idx, "finish", rationale="Agenda complete."))
     return actions
 
@@ -237,12 +234,10 @@ async def build_action_agenda(
     deterministic = _deterministic_actions(task, intent)
     actions = deterministic
     if _needs_llm_fallback(task, intent, deterministic):
-        print("🍎 Using LLM fallback for agenda planning due to detected complexity or missing actions.")
         try:
             llm_actions = await _llm_actions(task, intent, context_bundle, context)
             if llm_actions:
                 actions = llm_actions
-
         except Exception:
             context.logger().warning("deeplens_v6: agenda planner llm fallback failed", exc_info=True)
 
@@ -255,7 +250,4 @@ async def build_action_agenda(
         metadata={"intent": intent.to_dict()},
     )
     state.active_intent = intent.to_dict()
-
-    print(f"🍎 Built agenda with {len(agenda.actions)} actions (deterministic={len(deterministic)}, llm={len(actions)}) for task: {task.user_goal}")
-    print(f" actions: {[action.kind + (':' + action.name if action.name else '') for action in agenda.actions]}")
     return agenda

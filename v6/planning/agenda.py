@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from .types import ActionAgenda, AgendaAction, AgendaActionStatus, AgendaStatus
+from ..types import ActionAgenda, AgendaAction, AgendaActionStatus, AgendaStatus
 
 
-def next_pending_action(agenda: ActionAgenda) -> AgendaAction | None:
+def next_pending_action(agenda: ActionAgenda | None) -> AgendaAction | None:
+    if agenda is None or agenda.status in {AgendaStatus.FAILED, AgendaStatus.CANCELED, AgendaStatus.COMPLETED}:
+        return None
     for action in agenda.actions:
         if action.status == AgendaActionStatus.PENDING:
             return action
@@ -24,3 +26,12 @@ def mark_action_status(agenda: ActionAgenda, action_id: str, status: AgendaActio
     else:
         agenda.status = AgendaStatus.ACTIVE
 
+
+def replace_pending_tail(agenda: ActionAgenda, replacement_actions: list[AgendaAction]) -> ActionAgenda:
+    preserved = [action for action in agenda.actions if action.status != AgendaActionStatus.PENDING]
+    for idx, action in enumerate(replacement_actions, start=1):
+        if not action.action_id:
+            action.action_id = f"r{idx}"
+    agenda.actions = preserved + list(replacement_actions)
+    agenda.status = AgendaStatus.ACTIVE if agenda.actions else AgendaStatus.FAILED
+    return agenda

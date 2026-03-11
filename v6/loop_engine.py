@@ -3,16 +3,18 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any
 
-from .agenda import mark_action_status, next_pending_action
-from .agenda_planner import build_action_agenda
+from .context.memory_policy import build_context_bundle
 from .extraction import build_missing_prompt, resolve_task_fields
-from .memory_policy import build_context_bundle
-from .tool_dispatch import dispatch_tool_action
+from .planning.agenda import mark_action_status, next_pending_action, replace_pending_tail
+from .planning.agenda_planner import build_action_agenda
+from .recovery.recovery_engine import recover_failed_action
+from .tools.tool_dispatch import dispatch_tool_action
 from .types import (
     ActionAgenda,
     AgendaActionStatus,
     AgendaStatus,
     DeepLensTask,
+    RecoveryDecisionKind,
     ResponseOutcomeKind,
     TaskShape,
     ToolResult,
@@ -32,6 +34,15 @@ def _increment_retry(state: Any, key: str) -> int:
 
 def _reset_retry(state: Any, key: str) -> None:
     state.retry_counters.pop(key, None)
+
+
+def _increment_recovery_attempt(state: Any, key: str) -> int:
+    state.recovery_attempts[key] = state.recovery_attempts.get(key, 0) + 1
+    return state.recovery_attempts[key]
+
+
+def _reset_recovery_attempt(state: Any, key: str) -> None:
+    state.recovery_attempts.pop(key, None)
 
 
 def _sync_active_task(state: Any, task: DeepLensTask) -> None:
@@ -278,6 +289,7 @@ async def run_loop(
                 state.pending_action = None
                 if result.ok:
                     _reset_retry(state, tool_name or "tool")
+                    _reset_recovery_attempt(state, tool_name or "tool")
                     mark_action_status(agenda, action.action_id, AgendaActionStatus.COMPLETED)
                     await _emit_loop_update(
                         chan,
@@ -303,11 +315,88 @@ async def run_loop(
 
                 retries = _increment_retry(state, tool_name or "tool")
                 mark_action_status(agenda, action.action_id, AgendaActionStatus.FAILED)
-                if retries > 2:
+                recovery = await recover_failed_action(
+                    task=task,
+                    state=state,
+                    agenda=agenda,
+                    failed_action=action,
+                    result=result,
+                    context_bundle=context_bundle,
+                    context=context,
+                )
+                print(f"🍎 Recovery decision: {recovery.kind} reason: {recovery.reason} action: {recovery.action} replacement_actions: {recovery.replacement_actions}")
+                state.active_recovery = {
+                    "decision": recovery.kind.value,
+                    "reason": recovery.reason,
+                    "tool_name": tool_name,
+                }
+                if recovery.task is not None:
+                    task = recovery.task
+                if recovery.kind == RecoveryDecisionKind.RETRY_ACTION and recovery.action is not None:
+                    recovery_attempts = _increment_recovery_attempt(state, tool_name or "tool")
+                    if recovery_attempts > 2 or retries > 2:
+                        result_out = {
+                            "reply": f"I need human help after repeated failures while executing `{tool_name}`.",
+                            "state": state,
+                            "outcome_kind": ResponseOutcomeKind.ESCALATE,
+                            "last_tool_result": result,
+                        }
+                        return result_out
+                    await _emit_loop_update(
+                        chan,
+                        phase="execution.step",
+                        phase_status="active",
+                        label=f"Loop step {step_index + 1}",
+                        detail=f"Repairing {tool_name or 'tool'} before retry.",
+                        step_index=step_index,
+                        kind="repair",
+                        note_text=recovery.reason,
+                        tool_name=tool_name,
+                        loop_status="repairing",
+                    )
+                    action.args = dict(recovery.action.args)
+                    action.rationale = recovery.action.rationale
+                    action.status = AgendaActionStatus.PENDING
+                    agenda.status = AgendaStatus.ACTIVE
+                    continue
+                if recovery.kind == RecoveryDecisionKind.REPLACE_REMAINING_AGENDA:
+                    replace_pending_tail(agenda, recovery.replacement_actions)
+                    state.last_replan_reason = recovery.reason
+                    await _emit_loop_update(
+                        chan,
+                        phase="execution.step",
+                        phase_status="active",
+                        label=f"Loop step {step_index + 1}",
+                        detail="Replanned remaining agenda.",
+                        step_index=step_index,
+                        kind="repair",
+                        note_text=recovery.reason,
+                        tool_name=tool_name,
+                        loop_status="replanned",
+                    )
+                    context_bundle = await _refresh_loop_context(task, state, context, context_mode, agenda)
+                    continue
+                if recovery.kind == RecoveryDecisionKind.ASK_USER:
                     result_out = {
-                        "reply": f"I stopped after repeated failures while executing `{tool_name}`.",
+                        "reply": recovery.ask_user_prompt or build_missing_prompt(task),
+                        "state": state,
+                        "outcome_kind": ResponseOutcomeKind.WAITING,
+                        "last_tool_result": result,
+                    }
+                    return result_out
+                if recovery.kind == RecoveryDecisionKind.ESCALATE or retries > 2:
+                    result_out = {
+                        "reply": recovery.reason,
                         "state": state,
                         "outcome_kind": ResponseOutcomeKind.ESCALATE,
+                        "last_tool_result": result,
+                    }
+                    return result_out
+                if recovery.kind == RecoveryDecisionKind.FAIL:
+                    result_out = {
+                        "reply": recovery.reason,
+                        "state": state,
+                        "outcome_kind": ResponseOutcomeKind.FAILED,
                         "last_tool_result": result,
                     }
                     return result_out

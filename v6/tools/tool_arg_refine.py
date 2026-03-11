@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .extraction import (
+from ..extraction import (
     extract_design_spec,
     infer_analysis_mode,
     infer_export_formats,
@@ -19,6 +19,8 @@ REFINABLE_TOOLS = {
     "dl.export_lens",
 }
 
+_NUMERIC_DESIGN_FIELDS = {"fov", "fnum", "foclen", "imgh", "bfl", "thickness"}
+
 
 def _extract_latest_user_answer(task: Any) -> str:
     notes = list(getattr(task, "notes", []) or [])
@@ -29,6 +31,44 @@ def _extract_latest_user_answer(task: Any) -> str:
                 return raw[1:-1]
             return raw
     return ""
+
+
+def _coerce_float(value: Any) -> float | Any:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip().lower().replace("mm", "").replace("deg", "")
+        try:
+            return float(text.strip())
+        except ValueError:
+            return value
+    return value
+
+
+def normalize_tool_inputs(*, spec: Any, refined_inputs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
+    normalized = dict(refined_inputs)
+    invalid_fields: dict[str, str] = {}
+
+    if spec.name == "dl.create_lens":
+        design_spec = dict(normalized.get("design_spec") or {})
+        for key in _NUMERIC_DESIGN_FIELDS:
+            if key not in design_spec:
+                continue
+            coerced = _coerce_float(design_spec[key])
+            if isinstance(coerced, str):
+                invalid_fields[f"design_spec.{key}"] = f"expected numeric value, got {type(design_spec[key]).__name__}"
+                continue
+            design_spec[key] = coerced
+        normalized["design_spec"] = design_spec
+
+    if spec.name in {"dl.analysis", "dl.export_lens"}:
+        formats = normalized.get("formats")
+        if formats is None and isinstance(normalized.get("delivery_request"), dict):
+            formats = normalized["delivery_request"].get("formats")
+        if isinstance(formats, str):
+            normalized["formats"] = [formats]
+
+    return normalized, invalid_fields
 
 
 def _heuristic_refine_inputs(*, spec: Any, draft_inputs: dict[str, Any], task: Any) -> dict[str, Any]:
@@ -71,7 +111,8 @@ async def maybe_refine_tool_inputs_with_llm(
 ) -> dict[str, Any]:
     heuristically_refined = _heuristic_refine_inputs(spec=spec, draft_inputs=draft_inputs, task=task)
     if spec.name not in REFINABLE_TOOLS:
-        return heuristically_refined
+        normalized, _invalid_fields = normalize_tool_inputs(spec=spec, refined_inputs=heuristically_refined)
+        return normalized
 
     llm = context.llm()
     skills = context.skills()
@@ -130,7 +171,10 @@ async def maybe_refine_tool_inputs_with_llm(
         if isinstance(parsed, dict):
             merged = dict(heuristically_refined)
             merged.update(parsed)
-            return merged
+            normalized, _invalid_fields = normalize_tool_inputs(spec=spec, refined_inputs=merged)
+            return normalized
     except Exception:
-        return heuristically_refined
-    return heuristically_refined
+        normalized, _invalid_fields = normalize_tool_inputs(spec=spec, refined_inputs=heuristically_refined)
+        return normalized
+    normalized, _invalid_fields = normalize_tool_inputs(spec=spec, refined_inputs=heuristically_refined)
+    return normalized

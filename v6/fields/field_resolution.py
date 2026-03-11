@@ -1,6 +1,4 @@
-from __future__ import annotations
-
-from .fields.field_resolution import (
+from ..field_resolution import (
     attachment_suggests_lens,
     build_missing_prompt,
     compute_missing_fields,

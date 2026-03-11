@@ -5,8 +5,8 @@ from typing import Any
 
 from aethergraph import NodeContext, graph_fn
 
+from .context.memory_policy import build_context_bundle, maybe_distill_session_summary
 from .loop_engine import run_loop
-from .memory_policy import build_context_bundle, maybe_distill_session_summary
 from .response_compose import compose_reply
 from .response_frame import build_response_frame
 from .router import route
@@ -26,10 +26,13 @@ def _roll_loop_history(state: Any) -> None:
     state.loop_history = state.loop_history[-6:]
     state.loop_trace = []
     state.retry_counters = {}
+    state.recovery_attempts = {}
     state.pending_action = None
     state.pending_approval = None
     state.active_agenda = None
     state.active_intent = None
+    state.active_recovery = None
+    state.last_replan_reason = None
 
 
 @graph_fn(

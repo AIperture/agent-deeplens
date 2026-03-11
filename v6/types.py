@@ -93,6 +93,24 @@ class ResponseOutcomeKind(str, Enum):
     FAILED = "failed"
 
 
+class FailureKind(str, Enum):
+    INVALID_INPUTS = "invalid_inputs"
+    MISSING_INPUTS = "missing_inputs"
+    MISSING_DEPENDENCY = "missing_dependency"
+    TRANSIENT_TOOL_ERROR = "transient_tool_error"
+    INTERNAL_TOOL_ERROR = "internal_tool_error"
+    UNSAFE_ACTION = "unsafe_action"
+    UNKNOWN = "unknown"
+
+
+class RecoveryDecisionKind(str, Enum):
+    RETRY_ACTION = "retry_action"
+    REPLACE_REMAINING_AGENDA = "replace_remaining_agenda"
+    ASK_USER = "ask_user"
+    ESCALATE = "escalate"
+    FAIL = "fail"
+
+
 @dataclass
 class FieldValue:
     value: Any = None
@@ -262,8 +280,13 @@ class DeepLensState:
     pending_approval: dict[str, Any] | None = None
     approved_action: str | None = None
     retry_counters: dict[str, int] = field(default_factory=dict)
+    recovery_attempts: dict[str, int] = field(default_factory=dict)
     loop_trace: list[dict[str, Any]] = field(default_factory=list)
     loop_history: list[dict[str, Any]] = field(default_factory=list)
+    last_tool_result: dict[str, Any] = field(default_factory=dict)
+    failure_history: list[dict[str, Any]] = field(default_factory=list)
+    last_replan_reason: str | None = None
+    active_recovery: dict[str, Any] | None = None
     last_summary_tag: str = "session"
 
     def to_dict(self) -> dict[str, Any]:
@@ -305,12 +328,24 @@ class ToolResult:
     ok: bool
     summary: str
     status: str = "completed"
+    tool_name: str | None = None
     data: dict[str, Any] = field(default_factory=dict)
     artifacts: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     error_code: str | None = None
     retryable: bool = False
     run_id: str | None = None
+    failure_kind: FailureKind | None = None
+    blocking: bool = False
+    repairable: bool = False
+    needs_replan: bool = False
+    needs_user_input: bool = False
+    missing_fields: list[str] = field(default_factory=list)
+    invalid_fields: dict[str, str] = field(default_factory=dict)
+    repair_hints: list[str] = field(default_factory=list)
+    dependency_failures: list[str] = field(default_factory=list)
+    human_escalation_reason: str | None = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
     should_end_turn: bool = False
 
 
@@ -326,6 +361,17 @@ class ResponseFrame:
     last_tool_summary: str | None = None
     next_action_hints: list[str] = field(default_factory=list)
     active_run_id: str | None = None
+
+
+@dataclass
+class RecoveryDecision:
+    kind: RecoveryDecisionKind
+    reason: str
+    action: AgendaAction | None = None
+    replacement_actions: list[AgendaAction] = field(default_factory=list)
+    ask_user_prompt: str | None = None
+    task: DeepLensTask | None = None
+    outcome_kind: ResponseOutcomeKind | None = None
 
 
 ROUTER_JSON_SCHEMA: dict[str, Any] = {

@@ -5,7 +5,7 @@ from typing import Any
 
 from aethergraph import NodeContext
 
-from .types import ContextMode, DeepLensState, DeepLensTask
+from ..types import ContextMode, DeepLensState, DeepLensTask
 
 
 SESSION_SUMMARY_TAG = "session"
@@ -84,6 +84,11 @@ def _working_state(task: DeepLensTask, state: DeepLensState, artifact_limit: int
         "pending_action": state.pending_action,
         "pending_approval": state.pending_approval,
         "retry_counters": state.retry_counters,
+        "recovery_attempts": state.recovery_attempts,
+        "active_recovery": state.active_recovery,
+        "last_replan_reason": state.last_replan_reason,
+        "last_tool_result": state.last_tool_result,
+        "failure_history_tail": state.failure_history[-4:],
         "current_loop_trace_tail": state.loop_trace[-6:],
         "previous_loop_summaries": state.loop_history[-3:],
     }
