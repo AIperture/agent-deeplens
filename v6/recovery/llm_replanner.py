@@ -9,14 +9,131 @@ from ..tools.tool_registry import TOOL_REGISTRY
 from ..types import AgendaAction, DeepLensTask, RecoveryDecision, RecoveryDecisionKind, ResponseOutcomeKind, ToolResult
 
 
+def _string_array_schema() -> dict[str, Any]:
+    return {"type": "array", "items": {"type": "string"}}
+
+
+def _lens_source_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "artifact_id": {"type": ["string", "null"]},
+            "uri": {"type": ["string", "null"]},
+            "name": {"type": ["string", "null"]},
+        },
+        "required": ["artifact_id", "uri", "name"],
+        "additionalProperties": False,
+    }
+
+
+def _design_spec_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "fov": {"type": ["number", "string", "null"]},
+            "fnum": {"type": ["number", "string", "null"]},
+            "foclen": {"type": ["number", "string", "null"]},
+            "imgh": {"type": ["number", "string", "null"]},
+            "bfl": {"type": ["number", "string", "null"]},
+            "thickness": {"type": ["number", "string", "null"]},
+            "save_name": {"type": ["string", "null"]},
+            "baseline_analysis": {"type": ["boolean", "null"]},
+            "sensor_width_mm": {"type": ["number", "string", "null"]},
+            "sensor_height_mm": {"type": ["number", "string", "null"]},
+            "surf_list": {
+                "type": ["array", "null"],
+                "items": {"type": "object"},
+            },
+        },
+        "additionalProperties": False,
+    }
+
+
+def _analysis_request_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "mode": {"type": ["string", "null"], "enum": ["full", "spot", "mtf", "rms", None]},
+        },
+        "additionalProperties": False,
+    }
+
+
+def _run_request_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "goal": {"type": ["string", "null"]},
+            "constraints": _string_array_schema(),
+            "excluded_objectives": _string_array_schema(),
+            "iterations": {"type": ["integer", "number", "string", "null"]},
+            "checkpoint_every": {"type": ["integer", "number", "string", "null"]},
+            "export_formats": _string_array_schema(),
+        },
+        "additionalProperties": False,
+    }
+
+
+def _delivery_request_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "mode": {"type": ["string", "null"]},
+            "formats": _string_array_schema(),
+            "include": _string_array_schema(),
+        },
+        "additionalProperties": False,
+    }
+
+
+def _task_patch_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "design_spec": _design_spec_schema(),
+            "analysis_request": _analysis_request_schema(),
+            "run_request": _run_request_schema(),
+            "delivery_request": _delivery_request_schema(),
+            "lens_source": _lens_source_schema(),
+            "requested_capabilities": _string_array_schema(),
+            "notes": _string_array_schema(),
+        },
+        "additionalProperties": False,
+    }
+
+
+def _retry_patch_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "approval_prompt": {"type": ["string", "null"]},
+            "prompt": {"type": ["string", "null"]},
+            "run_id": {"type": ["string", "null"]},
+            "timeout_s": {"type": ["integer", "number", "string", "null"]},
+            "graph_id": {"type": ["string", "null"]},
+            "use_stub": {"type": ["boolean", "null"]},
+            "create_if_missing": {"type": ["boolean", "null"]},
+            "formats": _string_array_schema(),
+            "lens_source": _lens_source_schema(),
+            "design_spec": _design_spec_schema(),
+            "analysis_request": _analysis_request_schema(),
+            "run_request": _run_request_schema(),
+            "delivery_request": _delivery_request_schema(),
+            "invalid_fields": {"type": "object", "additionalProperties": {"type": "string"}},
+            "missing_fields": _string_array_schema(),
+        },
+        "additionalProperties": False,
+    }
+
+
 def _schema() -> dict[str, Any]:
     return {
         "type": "object",
         "properties": {
             "decision_kind": {"type": "string", "enum": ["retry_action", "replace_remaining_agenda", "ask_user", "escalate", "fail"]},
             "reason": {"type": "string"},
-            "updated_task_patch_json": {"type": "string"},
-            "retry_patch_json": {"type": "string"},
+            "updated_task_patch": _task_patch_schema(),
+            "retry_patch": _retry_patch_schema(),
             "replacement_actions": {
                 "type": "array",
                 "items": {
@@ -34,7 +151,7 @@ def _schema() -> dict[str, Any]:
             "ask_user_prompt": {"type": ["string", "null"]},
             "escalate_reason": {"type": ["string", "null"]},
         },
-        "required": ["decision_kind", "reason", "updated_task_patch_json", "retry_patch_json", "replacement_actions", "ask_user_prompt", "escalate_reason"],
+        "required": ["decision_kind", "reason", "updated_task_patch", "retry_patch", "replacement_actions", "ask_user_prompt", "escalate_reason"],
         "additionalProperties": False,
     }
 
@@ -149,14 +266,8 @@ async def llm_replan_after_failure(
         context.logger().warning("deeplens_v6: llm replanner failed", exc_info=True)
         return None
 
-    try:
-        task_patch = json.loads(obj.get("updated_task_patch_json") or "{}")
-    except Exception:
-        task_patch = {}
-    try:
-        retry_patch = json.loads(obj.get("retry_patch_json") or "{}")
-    except Exception:
-        retry_patch = {}
+    task_patch = obj.get("updated_task_patch") or {}
+    retry_patch = obj.get("retry_patch") or {}
     patched_task = _apply_task_patch(task, task_patch if isinstance(task_patch, dict) else {})
     decision_kind = RecoveryDecisionKind(str(obj.get("decision_kind") or "fail"))
     replacement_actions = _decode_actions(list(obj.get("replacement_actions") or []))

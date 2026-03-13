@@ -1,0 +1,138 @@
+from __future__ import annotations
+
+from typing import Any
+
+from .binding import bind_step
+from .interaction import apply_user_inputs, ask_for_approval, ask_for_missing_inputs
+from .policies import get_tool_policy
+from .tool_executor import execute_tool
+from .types import DeepLensTask, ErrorType, Plan, PlanStatus, RuntimeState, StepStatus
+
+
+async def _emit_tool_phase(*, step: Any, status: str, context: Any) -> None:
+    phase_status = {"running": "active", "succeeded": "done", "failed": "failed"}[status]
+    detail = {
+        "running": f"Running `{step.tool_name}`.",
+        "succeeded": f"Completed `{step.tool_name}`.",
+        "failed": f"`{step.tool_name}` failed.",
+    }[status]
+    await context.channel("ui:session").send_phase(
+        phase=f"tool.{step.tool_name}",
+        status=phase_status,
+        label=step.title,
+        detail=detail,
+        key_suffix=step.step_id,
+    )
+
+
+def _archive(state: RuntimeState, task: DeepLensTask, plan: Plan, tool_summaries: list[str]) -> None:
+    state.loop_history.append(
+        {
+            "task": task.to_dict(),
+            "plan": plan.to_dict(),
+            "summaries": tool_summaries[-4:],
+        }
+    )
+    state.loop_history = state.loop_history[-6:]
+
+
+async def run_loop(
+    *,
+    task: DeepLensTask,
+    plan: Plan,
+    state: RuntimeState,
+    context: Any,
+) -> dict[str, Any]:
+    tool_summaries: list[str] = []
+    plan.status = PlanStatus.RUNNING
+    state.active_task = task.to_dict()
+    state.active_plan = plan.to_dict()
+
+    if not plan.steps:
+        plan.status = PlanStatus.COMPLETED
+        _archive(state, task, plan, tool_summaries)
+        return {"plan": plan, "state": state, "tool_summaries": tool_summaries}
+
+    while plan.current_step < len(plan.steps):
+        step = plan.steps[plan.current_step]
+        step.status = StepStatus.RUNNING
+        step.attempts += 1
+
+        binding = bind_step(step, task, state)
+        if not binding.ok:
+            reply_text, files = await ask_for_missing_inputs(
+                missing_fields=binding.missing_fields,
+                task=task,
+                context=context,
+            )
+            task = await apply_user_inputs(
+                task=task,
+                text=reply_text,
+                attachments=files,
+                context=context,
+            )
+            state.active_task = task.to_dict()
+            state.active_plan = plan.to_dict()
+            retry_binding = bind_step(step, task, state)
+            if not retry_binding.ok:
+                step.status = StepStatus.FAILED
+                plan.status = PlanStatus.FAILED
+                state.final_reply = retry_binding.message
+                break
+            binding = retry_binding
+
+        policy = get_tool_policy(step.tool_policy_id)
+        if policy.requires_approval and not step.approval_granted:
+            approved = await ask_for_approval(
+                prompt=policy.approval_prompt or f"Approve `{step.tool_name}`?",
+                context=context,
+            )
+            if not approved:
+                step.status = StepStatus.CANCELLED
+                plan.status = PlanStatus.CANCELLED
+                state.final_reply = "Okay, I stopped before making changes."
+                break
+            step.approval_granted = True
+
+        await _emit_tool_phase(step=step, status="running", context=context)
+        result = await execute_tool(action=binding.action, task=task, state=state, context=context)
+        if result.ok:
+            await _emit_tool_phase(step=step, status="succeeded", context=context)
+            tool_summaries.append(result.summary)
+            step.status = StepStatus.SUCCEEDED
+            plan.current_step += 1
+            state.active_task = task.to_dict()
+            state.active_plan = plan.to_dict()
+            if result.should_end_turn:
+                plan.status = PlanStatus.COMPLETED
+                break
+            continue
+
+        await _emit_tool_phase(step=step, status="failed", context=context)
+        if result.error_type == ErrorType.MISSING_INPUT.value:
+            reply_text, files = await ask_for_missing_inputs(
+                missing_fields=step.required_fields or ["lens_source"],
+                task=task,
+                context=context,
+            )
+            task = await apply_user_inputs(
+                task=task,
+                text=reply_text,
+                attachments=files,
+                context=context,
+            )
+            state.active_task = task.to_dict()
+            state.active_plan = plan.to_dict()
+            if step.attempts < 2:
+                step.status = StepStatus.READY
+                continue
+        step.status = StepStatus.FAILED
+        plan.status = PlanStatus.FAILED
+        state.final_reply = result.summary or result.error_message or "The workflow failed."
+        break
+
+    if plan.status == PlanStatus.RUNNING:
+        plan.status = PlanStatus.COMPLETED
+    state.active_plan = plan.to_dict()
+    _archive(state, task, plan, tool_summaries)
+    return {"plan": plan, "state": state, "tool_summaries": tool_summaries}

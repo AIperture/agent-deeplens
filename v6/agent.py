@@ -10,10 +10,22 @@ from .loop_engine import run_loop
 from .response_compose import compose_reply
 from .response_frame import build_response_frame
 from .router import route
-from .types import ActionAgenda, ResponseOutcomeKind, TaskShape, load_state, save_state
+from .types import ActionAgenda, DeepLensTask, ResponseOutcomeKind, TaskShape, TERMINAL_TASK_STATUSES, load_state, save_state
 
 
-def _roll_loop_history(state: Any) -> None:
+def _clear_task_runtime_state(state: Any) -> None:
+    state.pending_action = None
+    state.pending_approval = None
+    state.active_agenda = None
+    state.active_intent = None
+    state.active_recovery = None
+    state.last_replan_reason = None
+    state.runtime_missing_fields = []
+    state.runtime_invalid_fields = {}
+    state.last_prompt_reason = None
+
+
+def _archive_current_task(state: Any) -> None:
     if not state.active_task and not state.loop_trace:
         return
     archived = {
@@ -27,12 +39,51 @@ def _roll_loop_history(state: Any) -> None:
     state.loop_trace = []
     state.retry_counters = {}
     state.recovery_attempts = {}
-    state.pending_action = None
-    state.pending_approval = None
-    state.active_agenda = None
-    state.active_intent = None
-    state.active_recovery = None
-    state.last_replan_reason = None
+    _clear_task_runtime_state(state)
+
+
+def _task_from_state(state: Any) -> DeepLensTask | None:
+    return DeepLensTask.from_dict(state.active_task if isinstance(state.active_task, dict) else None)
+
+
+def _prepare_task_transition(state: Any, turn_role: str) -> None:
+    prior_task = _task_from_state(state)
+    if turn_role != "new_task" or prior_task is None:
+        return
+    if prior_task.task_status not in TERMINAL_TASK_STATUSES:
+        prior_task.task_status = "superseded"
+        state.active_task = asdict(prior_task)
+    _archive_current_task(state)
+
+
+def _finalize_task_lifecycle(state: Any, out: dict[str, Any]) -> None:
+    task = _task_from_state(state)
+    if task is None:
+        return
+
+    agenda = ActionAgenda.from_dict(state.active_agenda)
+    outcome = out.get("outcome_kind", ResponseOutcomeKind.COMPLETE)
+
+    if outcome == ResponseOutcomeKind.WAITING:
+        task.task_status = "waiting"
+        state.active_task = asdict(task)
+        return
+
+    if outcome == ResponseOutcomeKind.COMPLETE and out.get("reply") == "Okay, I stopped before making changes.":
+        task.task_status = "canceled"
+    elif outcome == ResponseOutcomeKind.COMPLETE and agenda is not None and agenda.status.value == "waiting":
+        task.task_status = "waiting"
+        state.active_task = asdict(task)
+        return
+    elif outcome == ResponseOutcomeKind.COMPLETE:
+        task.task_status = "completed"
+    elif outcome in {ResponseOutcomeKind.ESCALATE, ResponseOutcomeKind.FAILED}:
+        task.task_status = "failed"
+
+    state.active_task = asdict(task)
+    _archive_current_task(state)
+    if task.task_status in TERMINAL_TASK_STATUSES:
+        state.active_task = None
 
 
 @graph_fn(
@@ -99,13 +150,14 @@ async def deeplens_agent(
     )
     decision = route_result["decision"]
     state = route_result["state"]
+    turn_role = route_result.get("turn_role", "new_task")
 
     if route_result["immediate_reply"]:
         reply = route_result["immediate_reply"] or ""
     elif decision["task_shape"] == TaskShape.UNSUPPORTED:
         reply = "This DeepLens agent currently supports lens design, analysis, export, optimization submission, and run status or cancellation."
     else:
-        _roll_loop_history(state)
+        _prepare_task_transition(state, turn_role)
         state.context_mode = decision["context_mode"].value
         state.active_task = asdict(decision["task"])
         await save_state(context=context, state=state)
@@ -124,6 +176,7 @@ async def deeplens_agent(
             context=context,
         )
         state = out.get("state", state)
+        _finalize_task_lifecycle(state, out)
         agenda = ActionAgenda.from_dict(state.active_agenda)
         frame = build_response_frame(
             reply=out["reply"],

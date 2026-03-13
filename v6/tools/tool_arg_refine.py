@@ -22,6 +22,145 @@ REFINABLE_TOOLS = {
 _NUMERIC_DESIGN_FIELDS = {"fov", "fnum", "foclen", "imgh", "bfl", "thickness"}
 
 
+def _string_array_schema() -> dict[str, Any]:
+    return {"type": "array", "items": {"type": "string"}}
+
+
+def _lens_source_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "artifact_id": {"type": ["string", "null"]},
+            "uri": {"type": ["string", "null"]},
+            "name": {"type": ["string", "null"]},
+        },
+        "required": ["artifact_id", "uri", "name"],
+        "additionalProperties": False,
+    }
+
+
+def _design_spec_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "fov": {"type": ["number", "string", "null"]},
+            "fnum": {"type": ["number", "string", "null"]},
+            "foclen": {"type": ["number", "string", "null"]},
+            "imgh": {"type": ["number", "string", "null"]},
+            "bfl": {"type": ["number", "string", "null"]},
+            "thickness": {"type": ["number", "string", "null"]},
+            "save_name": {"type": ["string", "null"]},
+            "baseline_analysis": {"type": ["boolean", "null"]},
+            "sensor_width_mm": {"type": ["number", "string", "null"]},
+            "sensor_height_mm": {"type": ["number", "string", "null"]},
+            "surf_list": {
+                "type": ["array", "null"],
+                "items": {"type": "object"},
+            },
+        },
+        "additionalProperties": False,
+    }
+
+
+def _analysis_request_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "mode": {"type": ["string", "null"], "enum": ["full", "spot", "mtf", "rms", None]},
+        },
+        "additionalProperties": False,
+    }
+
+
+def _delivery_request_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "mode": {"type": ["string", "null"]},
+            "formats": _string_array_schema(),
+            "include": _string_array_schema(),
+        },
+        "additionalProperties": False,
+    }
+
+
+def _run_request_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "goal": {"type": ["string", "null"]},
+            "constraints": _string_array_schema(),
+            "excluded_objectives": _string_array_schema(),
+            "iterations": {"type": ["integer", "number", "string", "null"]},
+            "checkpoint_every": {"type": ["integer", "number", "string", "null"]},
+            "export_formats": _string_array_schema(),
+        },
+        "additionalProperties": False,
+    }
+
+
+def _refinement_schema_for_tool(tool_name: str) -> dict[str, Any]:
+    base_properties: dict[str, Any] = {
+        "use_stub": {"type": ["boolean", "null"]},
+    }
+    properties = dict(base_properties)
+
+    if tool_name == "dl.create_lens":
+        properties.update(
+            {
+                "design_spec": _design_spec_schema(),
+                "analysis_request": _analysis_request_schema(),
+                "formats": _string_array_schema(),
+            }
+        )
+    elif tool_name == "dl.analysis":
+        properties.update(
+            {
+                "lens_source": _lens_source_schema(),
+                "design_spec": _design_spec_schema(),
+                "analysis_request": _analysis_request_schema(),
+                "delivery_request": _delivery_request_schema(),
+                "create_if_missing": {"type": ["boolean", "null"]},
+                "formats": _string_array_schema(),
+            }
+        )
+    elif tool_name == "dl.export_lens":
+        properties.update(
+            {
+                "lens_source": _lens_source_schema(),
+                "delivery_request": _delivery_request_schema(),
+                "formats": _string_array_schema(),
+            }
+        )
+    elif tool_name == "ag.spawn_graph":
+        properties.update(
+            {
+                "graph_id": {"type": ["string", "null"]},
+                "lens_source": _lens_source_schema(),
+                "run_request": _run_request_schema(),
+            }
+        )
+    elif tool_name == "ag.status":
+        properties.update(
+            {
+                "run_id": {"type": ["string", "null"]},
+                "timeout_s": {"type": ["integer", "number", "string", "null"]},
+            }
+        )
+    elif tool_name == "ag.cancel":
+        properties.update(
+            {
+                "run_id": {"type": ["string", "null"]},
+            }
+        )
+
+    return {
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": False,
+    }
+
+
 def _extract_latest_user_answer(task: Any) -> str:
     notes = list(getattr(task, "notes", []) or [])
     for note in reversed(notes):
@@ -143,14 +282,7 @@ async def maybe_refine_tool_inputs_with_llm(
             "design_draft": state.design_draft,
         },
     }
-    response_schema = {
-        "type": "object",
-        "properties": {
-            "refined_json": {"type": "string"},
-        },
-        "required": ["refined_json"],
-        "additionalProperties": False,
-    }
+    response_schema = _refinement_schema_for_tool(spec.name)
     try:
         resp, _usage = await llm.chat(
             messages=[
@@ -162,18 +294,17 @@ async def maybe_refine_tool_inputs_with_llm(
             schema_name="DeepLensV6ToolInputRefine",
             strict_schema=True,
             validate_json=True,
-            max_output_tokens=400,
+            max_output_tokens=700,
             reasoning_effort="low",
         )
-        obj = json.loads(resp) if isinstance(resp, str) else resp
-        raw_refined = obj.get("refined_json") or "{}"
-        parsed = json.loads(raw_refined)
+        parsed = json.loads(resp) if isinstance(resp, str) else resp
         if isinstance(parsed, dict):
             merged = dict(heuristically_refined)
             merged.update(parsed)
             normalized, _invalid_fields = normalize_tool_inputs(spec=spec, refined_inputs=merged)
             return normalized
-    except Exception:
+    except Exception as exc:
+        context.logger().error(f"LLM input refinement failed for tool {spec.name}, falling back to heuristic refinement. LLM error: {exc}", exc_info=True)
         normalized, _invalid_fields = normalize_tool_inputs(spec=spec, refined_inputs=heuristically_refined)
         return normalized
     normalized, _invalid_fields = normalize_tool_inputs(spec=spec, refined_inputs=heuristically_refined)
