@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from v3.extraction import extract_design_spec, extract_run_request, infer_analysis_mode, infer_export_formats
 from .types import DeepLensTask
+
+
+logger = logging.getLogger("ag.deeplens.v7.interaction")
 
 
 def build_missing_prompt(missing_fields: list[str]) -> str:
@@ -50,6 +54,18 @@ async def ask_for_approval(*, prompt: str, context: Any) -> bool:
     response = await context.channel("ui:session").ask_approval(
         prompt=prompt,
         options=["Approve", "Reject"],
+    )
+    if isinstance(response, dict):
+        return bool(response.get("approved"))
+    return parse_approval_response(str(response))
+
+
+async def confirm_plan(*, summary: str, prompt: str, context: Any) -> bool:
+    channel = context.channel("ui:session")
+    await channel.send_text(summary)
+    response = await channel.ask_approval(
+        prompt=prompt,
+        options=["Confirm", "Cancel"],
     )
     if isinstance(response, dict):
         return bool(response.get("approved"))
@@ -130,7 +146,7 @@ async def apply_user_inputs(
             schema_name="DeepLensV7UserReply",
             strict_schema=True,
             validate_json=True,
-            max_output_tokens=220,
+            max_output_tokens=1024,
         )
         obj = json.loads(response) if isinstance(response, str) else response
         for attr, key in (
@@ -144,5 +160,5 @@ async def apply_user_inputs(
             if isinstance(parsed, dict):
                 setattr(updated, attr, parsed)
     except Exception:
-        pass
+        logger.warning("deeplens_v7: user-input extraction llm failed; using heuristic fallback", exc_info=True)
     return updated

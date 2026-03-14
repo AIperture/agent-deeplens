@@ -8,11 +8,11 @@ from .backend import (
     _artifact_to_ref,
     build_optimization_inputs,
     create_lens_design,
-    deliver_artifacts,
     export_lens,
     load_text_or_json_payload,
     maybe_extract_filename,
     missing_design_fields,
+    persist_output_files,
     resolve_lens_source,
     run_analysis,
     summarize_artifacts,
@@ -171,7 +171,7 @@ async def _exec_ag_send_file(*, resolved_inputs: dict[str, Any], context: Any, *
     return ToolResult(ok=True, tool_name="ag.send_file", summary=f"Sent file `{filename}` to the UI.")
 
 
-async def _exec_ag_spawn_graph(*, resolved_inputs: dict[str, Any], task: Any, state: RuntimeState, context: Any, **_: Any) -> ToolResult:
+async def _exec_dl_optimize(*, resolved_inputs: dict[str, Any], task: Any, state: RuntimeState, context: Any, **_: Any) -> ToolResult:
     source = task.lens_source or state.active_source_ref
     if resolved_inputs.get("lens_source") or source:
         try:
@@ -182,7 +182,7 @@ async def _exec_ag_spawn_graph(*, resolved_inputs: dict[str, Any], task: Any, st
                 context=context,
             )
         except Exception:
-            logger.warning("ag.spawn_graph: resolve_lens_source failed, using fallback", exc_info=True)
+            logger.warning("dl.optimize: resolve_lens_source failed, using fallback", exc_info=True)
     graph_id = str(resolved_inputs.get("graph_id") or "deeplens_v7_optimize_workflow")
     graph_inputs = build_optimization_inputs(
         resolved_inputs=resolved_inputs,
@@ -195,10 +195,10 @@ async def _exec_ag_spawn_graph(*, resolved_inputs: dict[str, Any], task: Any, st
         inputs=graph_inputs,
         tags=["ag.deeplens.v7", "workflow:optimization"],
     )
-    _record_pending_run(state, run_id, graph_id, meta={"source_action": "ag.spawn_graph"})
+    _record_pending_run(state, run_id, graph_id, meta={"source_action": "dl.optimize"})
     return ToolResult(
         ok=True,
-        tool_name="ag.spawn_graph",
+        tool_name="dl.optimize",
         summary=(
             f"Started background workflow `{graph_id}`.\n"
             f"Run ID: `{run_id}`.\n"
@@ -356,18 +356,7 @@ async def _exec_dl_create_lens(*, resolved_inputs: dict[str, Any], state: Runtim
             error_type=ErrorType.UNEXPECTED.value,
             error_message=str(exc),
         )
-    artifacts: list[dict[str, Any]] = []
-    for path in sorted(created["result_dir"].rglob("*")):
-        if not path.is_file():
-            continue
-        artifact = await context.artifacts().save_file(
-            path=str(path),
-            kind="image" if path.suffix.lower() in {".png", ".jpg", ".jpeg"} else ("json" if path.suffix.lower() == ".json" else "file"),
-            name=path.name,
-            labels={"tag": "design"},
-        )
-        artifacts.append(_artifact_to_ref(artifact))
-    await deliver_artifacts(artifacts=artifacts, context=context)
+    artifacts = await persist_output_files(result_dir=created["result_dir"], context=context, tag="design")
     active_lens_ref = next((item.get("artifact_id") for item in artifacts if str(item.get("name")).endswith(".json")), None)
     active_source_ref = next((item for item in artifacts if str(item.get("name")).endswith(".json")), {})
     return ToolResult(
@@ -428,7 +417,7 @@ EXECUTORS = {
     "ag.save_json_artifact": _exec_ag_save_json_artifact,
     "ag.send_image": _exec_ag_send_image,
     "ag.send_file": _exec_ag_send_file,
-    "ag.spawn_graph": _exec_ag_spawn_graph,
+    "dl.optimize": _exec_dl_optimize,
     "ag.status": _exec_ag_status,
     "ag.cancel": _exec_ag_cancel,
     "dl.load_lens": _exec_dl_load_lens,

@@ -35,6 +35,12 @@ class StepStatus(str, Enum):
     SKIPPED = "skipped"
 
 
+class ArtifactDeliveryMode(str, Enum):
+    NEVER = "never"
+    ON_REQUEST = "on_request"
+    ALWAYS = "always"
+
+
 class ErrorType(str, Enum):
     MISSING_INPUT = "missing_input"
     INVALID_INPUT = "invalid_input"
@@ -163,6 +169,11 @@ class ToolSpec:
     required_args: list[str]
     optional_args: list[str] = field(default_factory=list)
     defaults: dict[str, Any] = field(default_factory=dict)
+    required_input_paths: list[str] = field(default_factory=list)
+    plan_arg_paths: list[str] = field(default_factory=list)
+    artifact_output_kinds: list[str] = field(default_factory=list)
+    artifact_delivery_mode: str = ArtifactDeliveryMode.NEVER.value
+    artifact_selector_kind: str | None = None
     tool_policy_id: str = "default_tool"
     interaction_policy_id: str | None = None
     description: str = ""
@@ -182,6 +193,7 @@ class BindingResult:
     action: BoundAction | None = None
     missing_fields: list[str] = field(default_factory=list)
     message: str = ""
+    resolved_args: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

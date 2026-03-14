@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from .binding import bind_step
-from .interaction import apply_user_inputs, ask_for_approval, ask_for_missing_inputs
-from .policies import get_tool_policy
+from .interaction import apply_user_inputs, ask_for_approval, ask_for_missing_inputs, confirm_plan
+from .policies import get_plan_policy, get_tool_policy, should_confirm_plan
 from .tool_executor import execute_tool
 from .types import DeepLensTask, ErrorType, Plan, PlanStatus, RuntimeState, StepStatus
 
@@ -36,6 +37,52 @@ def _archive(state: RuntimeState, task: DeepLensTask, plan: Plan, tool_summaries
     state.loop_history = state.loop_history[-6:]
 
 
+def _plan_summary(task: DeepLensTask, plan: Plan, state: RuntimeState) -> str:
+    lines = [f"Plan for: {task.user_goal or 'DeepLens request'}"]
+    for index, step in enumerate(plan.steps, start=1):
+        binding = bind_step(step, task, state)
+        args_json = json.dumps(binding.resolved_args, indent=2, ensure_ascii=False, sort_keys=True)
+        lines.append(f"{index}. {step.title}")
+        lines.append(f"Tool: {step.tool_name}")
+        lines.append(f"Goal: {step.goal}")
+        # lines.append("Args:")
+        # lines.append(args_json)
+        if binding.missing_fields:
+            lines.append(f"Missing before execution: {', '.join(binding.missing_fields)}")
+    return "\n".join(lines)
+
+
+async def _confirm_plan_if_needed(*, task: DeepLensTask, plan: Plan, state: RuntimeState, context: Any) -> bool:
+    if not should_confirm_plan(plan):
+        return True
+    summary = _plan_summary(task, plan, state)
+    policy = get_plan_policy(plan)
+    await context.channel("ui:session").send_phase(
+        phase="plan.confirmation",
+        status="active",
+        label="Plan confirmation",
+        detail="Waiting for plan confirmation before execution.",
+    )
+    confirmed = await confirm_plan(summary=summary, prompt=policy.confirmation_prompt, context=context)
+    if confirmed:
+        await context.channel("ui:session").send_phase(
+            phase="plan.confirmation",
+            status="done",
+            label="Plan confirmed",
+            detail="Plan confirmed. Starting execution.",
+        )
+        return True
+    plan.status = PlanStatus.CANCELLED
+    state.final_reply = "Okay, I stopped before executing the plan."
+    await context.channel("ui:session").send_phase(
+        phase="plan.confirmation",
+        status="failed",
+        label="Plan cancelled",
+        detail="Execution cancelled before the first step.",
+    )
+    return False
+
+
 async def run_loop(
     *,
     task: DeepLensTask,
@@ -44,7 +91,6 @@ async def run_loop(
     context: Any,
 ) -> dict[str, Any]:
     tool_summaries: list[str] = []
-    plan.status = PlanStatus.RUNNING
     state.active_task = task.to_dict()
     state.active_plan = plan.to_dict()
 
@@ -52,6 +98,14 @@ async def run_loop(
         plan.status = PlanStatus.COMPLETED
         _archive(state, task, plan, tool_summaries)
         return {"plan": plan, "state": state, "tool_summaries": tool_summaries}
+
+    if not await _confirm_plan_if_needed(task=task, plan=plan, state=state, context=context):
+        state.active_plan = plan.to_dict()
+        _archive(state, task, plan, tool_summaries)
+        return {"plan": plan, "state": state, "tool_summaries": tool_summaries}
+
+    plan.status = PlanStatus.RUNNING
+    state.active_plan = plan.to_dict()
 
     while plan.current_step < len(plan.steps):
         step = plan.steps[plan.current_step]
@@ -111,7 +165,7 @@ async def run_loop(
         await _emit_tool_phase(step=step, status="failed", context=context)
         if result.error_type == ErrorType.MISSING_INPUT.value:
             reply_text, files = await ask_for_missing_inputs(
-                missing_fields=step.required_fields or ["lens_source"],
+                missing_fields=binding.missing_fields or step.required_fields or ["lens_source"],
                 task=task,
                 context=context,
             )

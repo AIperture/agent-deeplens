@@ -58,7 +58,7 @@ async def deeplens_agent(
     )
     await maybe_distill_session_summary(context)
 
-    task = build_task(raw_message, attachments, state)
+    task = await build_task(raw_message, attachments, state, context)
     
     await context.emit_agent_event(event_type="task_built", summary="Task built successfully", payload=task.__dict__)
     

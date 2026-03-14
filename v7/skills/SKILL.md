@@ -34,11 +34,24 @@ Create a short executable plan for the current DeepLens task.
 
 Rules:
 - Each step must use exactly one fixed tool.
-- Use only: `dl.create_lens`, `dl.analysis`, `dl.export_lens`, `ag.spawn_graph`, `ag.status`, `ag.cancel`.
+- Use only: `dl.create_lens`, `dl.load_lens`, `dl.analysis`, `dl.optimize`, `dl.export_lens`, `ag.send_file`, `ag.send_image`, `ag.status`, `ag.cancel`.
+- Return explicit `arg_overrides_json` for every step.
 - Do not invent router steps, capability-selection steps, or hidden tools.
-- If the request is optimization, plan only the submission step; approval happens outside the planner.
+- If no lens source is available for analysis, optimize, or export, add an explicit `dl.create_lens` step first when the user provided enough design inputs.
+- Add explicit send steps only when the request clearly asks to send, show, deliver, download, or export artifacts.
+- If the request is optimization, `dl.optimize` must be a standalone submission step; do not bundle artifact delivery or export into it.
 - If the request is status or cancel, plan only that run-control step.
 - Prefer the shortest valid tool sequence.
+
+## deeplens.extract
+
+Extract the current DeepLens task from the user message.
+
+Rules:
+- Prefer workflow execution unless the user is clearly asking for explanation only.
+- Fill `requested_capabilities` using only: `design`, `analysis`, `optimize`, `export`, `status`, `cancel`, `explain`.
+- Return JSON strings for design spec, analysis request, run request, and delivery request.
+- Do not invent lens files, artifact ids, or run ids.
 
 ## deeplens.parse
 
