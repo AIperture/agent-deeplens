@@ -133,6 +133,7 @@ Create a lens set with four lenses, all with aspherical surfaces, 60 degree FOV,
 
 ### Analysis
 
+You can upload a file or attach one from `Outputs` and then send: 
 ```text
 Analyze this uploaded lens.
 ```
@@ -187,13 +188,17 @@ The current `v7` surface is intentionally narrow and execution-oriented:
 
 These are actual `v7` limitations:
 - The agent is not an open-ended DeepLens copilot. It only supports the fixed create, load, analyze, export, optimize, status, and cancel workflow surface.
-- Planning is LLM-backed but bounded. It cannot invent new tools or custom workflow stages.
-- `dl.create_lens` still requires `fov` and `fnum`. If those are missing, the agent will ask rather than infer aggressively.
 - `surf_list` parsing is improved, but heuristics are still narrow. It handles explicit nested lists and some shorthand patterns like uniform all-aspheric or all-spheric layouts. More complex optical-layout prose may still need clarification.
 - Analysis mode support is still limited to `full`, `spot`, `mtf`, and `rms`.
-- Optimization is background submission only. The chat turn does not become a full live optimization console.
-- Lens support remains centered on `.json` and `.zmx`.
-- Error reporting is practical but still backend-oriented in some failure paths.
+
+
+## Next Steps
+
+We can improve the agent towards a general design agent or copilot with the improvements:
+- Introduce lens generator agent as the very first planning step when needed; it should translate user request to initial design spec. The design of such agent can be heuristics-based or ReAct-based loop 
+- Introduce optimization agent for auto-tune the specs and optimization hyperparamters. This should have its own agent loop with instructions on optimization strategies 
+- Tighten the UX in planned steps in SKILL.md
+
 
 ## Practical Guidance
 
