@@ -1,32 +1,55 @@
 # aethergraph-agent-deeplens
 
-This package is currently centered on `v3`, a workflow-first DeepLens assistant for AetherGraph.
+This package is now centered on `v7`, a bounded DeepLens assistant for AetherGraph with:
+- spec-driven extraction owned by `v7`
+- fixed-tool planning with deterministic fallback
+- session memory for active lens, artifacts, and run tracking
+- background optimization submission through AG child runs
 
-`v3` is the version to use if you want:
-- chat-driven lens analysis from `.json` or `.zmx` inputs
-- starting-point lens design from a small spec
-- artifact export back into the AG UI
-- long-running optimization submitted as a background AG run
-- session memory for active lens, recent artifacts, and active run tracking
+The main entrypoint to use is:
+- module: `v7`
+- agent: `deeplens_agent_v7`
+- UI title: `DeepLens Assistant v7`
 
-## What v3 Does
+## What V7 Registers
 
-The `v3/` package registers:
+The `v7/` package exports:
 - `deeplens_agent`
-- `deeplens_v3_optimize_workflow`
+- `deeplens_v7_optimize_launcher`
+- `deeplens_v7_optimize_workflow`
 
-The chat agent supports these main actions:
-- Analyze an uploaded or active lens with `dl.analysis`
-- Create a starting lens from required design fields with `dl.create_lens`
-- Export the active lens to JSON and/or ZMX with `dl.export_lens`
-- Submit optimization as a background child run with `ag.spawn_graph`
-- Check or cancel the active child run with `ag.status` and `ag.cancel`
+The chat agent plans and executes only this bounded workflow surface:
+- `dl.create_lens`
+- `dl.load_lens`
+- `dl.analysis`
+- `dl.optimize`
+- `dl.export_lens`
+- `ag.status`
+- `ag.cancel`
+- `ag.send_file`
+- `ag.send_image`
 
-The runtime keeps a session-scoped state record for:
-- active lens source
-- active run id
-- last metrics and artifacts
-- recent loop trace and pending runs
+## What V7 Can Do
+
+`v7` supports these user-facing capabilities:
+- Create a starting lens from a design spec. Required fields are `fov` and `fnum`.
+- Parse optional design fields such as `foclen`, `imgh`, `bfl`, `thickness`, `save_name`, and `surf_list`.
+- Analyze an uploaded or active lens with `full`, `spot`, `mtf`, or `rms` modes.
+- Export the active or provided lens to `json` and/or `zmx`.
+- Submit a background optimization run and track its AG run id.
+- Check status or request cancellation for the active or specified run.
+- Deliver generated artifacts back into the UI when the user clearly asks to send, show, download, or export them.
+
+## What Changed In V7
+
+Compared with earlier versions, `v7` now uses a local parse and field-spec layer instead of relying on `v3` extraction logic.
+
+That means:
+- extraction prompts are tool-aware
+- missing-input prompts are generated from field metadata rather than hardcoded labels
+- defaults are applied at binding time from `ToolSpec`
+- required inputs are validated in binding before execution
+- planner output is still bounded to the fixed DeepLens tool set
 
 ## Essential Setup
 
@@ -34,15 +57,11 @@ Run commands from `aethergraph-agent-deeplens/`.
 
 1. Install AetherGraph.
 
-Install from PyPI:
-
 ```bash
 pip install aethergraph
 ```
 
-You should then have the `aethergraph` CLI available.
-
-2. Create a local env file from the example:
+2. Create a local env file:
 
 ```bash
 cp .env.example .env
@@ -54,102 +73,133 @@ Windows PowerShell:
 Copy-Item .env.example .env
 ```
 
-3. Fill in the minimal LLM settings.
+3. Fill in the essential LLM settings.
 
-The essential variables for `v3` are:
+Minimum expected settings:
 - `AETHERGRAPH_ROOT=./aethergraph_data`
 - `AETHERGRAPH_LLM__ENABLED=true`
 - `AETHERGRAPH_LLM__DEFAULT__PROVIDER=openai`
-- `AETHERGRAPH_LLM__DEFAULT__MODEL=gpt-5o-mini`
+- `AETHERGRAPH_LLM__DEFAULT__MODEL=gpt-5-mini`
 - `AETHERGRAPH_LLM__DEFAULT__API_KEY=...`
+- `AETHERGRAPH_LLM__PROVIFILE__FAST__PROVIDER=openai`
+- `AETHERGRAPH_LLM__PROVIFILE__FAST__MODEL=gpt-4o-mini`
+- `AETHERGRAPH_LLM__PROVIFILE__FAST__API_KEY=...`
 
-`gpt-5o-mini` is the minimum recommended default model because `v3` uses the default LLM for routing, loop decisions, and tool-argument refinement. If you want to use AetherGraph's generic env overrides instead, `LLM_PROVIDER`, `LLM_MODEL`, and `OPENAI_API_KEY` are also supported by the runtime.
 
-4. Start the AG server and load `v3`:
+`v7` uses LLM-backed task extraction, follow-up parsing, and planning. It also has deterministic fallbacks when extraction or planning fails.
+
+4. Start the AG server and load `v7`:
 
 ```bash
-aethergraph serve --project-root . --workspace ./aethergraph_data --load-module v3 --reload --reload-dir v3
+aethergraph serve --project-root . --workspace ./aethergraph_data --load-module v7 --reload --reload-dir v7
 ```
 
-Windows PowerShell uses the same command.
+5. Launch the agent in the UI.
 
-When the server starts, AetherGraph prints the key local URLs in the terminal, including:
-- server URL
-- UI URL
-- API URL
-- workspace path
-
-The log file for this workspace is:
-- `aethergraph_data/logs/aethergraph.log`
-
-If the default port is available, the UI is usually at:
-- `http://127.0.0.1:8745/ui`
-
-5. Start the agent in the UI.
-
-In the AetherGraph UI:
-- select `Agents` on the left sidebar
-- launch `DeepLens Assistant`
+In AetherGraph UI:
+- open `Agents`
+- launch `DeepLens Assistant v7`
 - start chatting with it
 
-## Typical Requests
+If the default port is available, the UI is usually:
+- `http://127.0.0.1:8745/ui`
 
-Examples that match the current implementation:
+Workspace log file:
+- `aethergraph_data/logs/aethergraph.log`
+
+## Prompts To Try
+
+These prompts match the current `v7` behavior and are good smoke tests.
+
+### Basic design
 
 ```text
-/analysis analyze this uploaded lens
-/analysis show MTF for this lens
-/design create a starting lens with 60 degree FOV, f/2.8, 35 mm focal length
-/optimize optimize this lens for 500 iterations
+Create a starting lens with 60 degree FOV, f/2.8, and 35 mm focal length.
+```
+
+```text
+Design a new lens with 50 deg FOV and f/4. Use defaults for the rest.
+```
+
+### Design with surf_list
+
+```text
+Create a lens with 55 degree FOV, f/2.8, and surf_list [["Aspheric", "Aspheric"], ["Aperture"], ["Aspheric", "Aspheric"]].
+```
+
+```text
+Create a lens set with four lenses, all with aspherical surfaces, 60 degree FOV, and f/2.8.
+```
+
+### Analysis
+
+```text
+Analyze this uploaded lens.
+```
+
+```text
+Run MTF analysis on the active lens and send me the files.
+```
+
+### Export
+
+```text
+Export the active lens as JSON and ZMX.
+```
+
+### Optimization
+
+```text
+Optimize this lens for 500 iterations with checkpoint every 100.
+```
+
+```text
+Optimize the active lens for edge sharpness, keep compact packaging, and save JSON plus ZMX.
+```
+
+### Run control
+
+```text
 status
+```
+
+```text
 cancel
 ```
 
-Design creation currently requires:
-- `fov`
-- `fnum`
-- one of `foclen` or `imgh`
-
-If those are missing, the agent asks for them instead of guessing.
+```text
+Check run abc123xyz
+```
 
 ## Current Capabilities
 
-The current `v3` surface is intentionally narrow and practical:
-
-- Lens input resolution from uploaded artifacts, local file paths, or the active session lens
-- Workflow-level analysis with summary plus generated files
-- Starting-point lens creation with baseline output artifacts
-- Export of the active/provided lens to JSON and ZMX
-- Background optimization submission through `deeplens_v3_optimize_workflow`
-- Run tracking, run status checks, and cancellation through the AG runner
-- Artifact delivery back into the AG UI as files and images
-- Session memory for recently active context
-- Stub execution paths for analysis, export, and optimization when explicitly requested
+The current `v7` surface is intentionally narrow and execution-oriented:
+- Lens source resolution from uploads, active session state, or explicit refs
+- Tool-aware extraction of design, analysis, run, and delivery parameters
+- Missing-input recovery through follow-up questions
+- Starting-point lens creation with optional `surf_list`
+- Background optimization submission with AG runner integration
+- Session memory for active source, active run, recent artifacts, and prior plan history
+- Artifact delivery back into the UI
+- Stub execution paths when explicitly requested
 
 ## Current Limitations
 
-These are real limitations in the current code, not wishlist items:
+These are actual `v7` limitations:
+- The agent is not an open-ended DeepLens copilot. It only supports the fixed create, load, analyze, export, optimize, status, and cancel workflow surface.
+- Planning is LLM-backed but bounded. It cannot invent new tools or custom workflow stages.
+- `dl.create_lens` still requires `fov` and `fnum`. If those are missing, the agent will ask rather than infer aggressively.
+- `surf_list` parsing is improved, but heuristics are still narrow. It handles explicit nested lists and some shorthand patterns like uniform all-aspheric or all-spheric layouts. More complex optical-layout prose may still need clarification.
+- Analysis mode support is still limited to `full`, `spot`, `mtf`, and `rms`.
+- Optimization is background submission only. The chat turn does not become a full live optimization console.
+- Lens support remains centered on `.json` and `.zmx`.
+- Error reporting is practical but still backend-oriented in some failure paths.
 
-- Request extraction is still mostly regex and keyword based. Free-form design specs and optimization intents can be misread or only partially captured.
-- The supported workflow surface is narrow: analysis, starting design, export, optimization submission, status, and cancel. It is not a general DeepLens copilot yet.
-- UX is functional but not polished. The agent relies on chat messages, approval prompts, and artifact/file delivery rather than a purpose-built workflow UI.
-- Analysis mode selection is coarse today: `full`, `spot`, `mtf`, and `rms`.
-- Design generation is a starting-point scaffold, not a full constraint solver or iterative design assistant.
-- Optimization is background-only. The main chat turn does not stream detailed iterative progress beyond AG run semantics.
-- The agent is conservative about missing information and may stop to ask for fields instead of inferring aggressively.
-- Lens support is centered on `.json` and `.zmx`.
-- Error handling is serviceable but still backend-oriented; failures often surface as direct exception summaries.
+## Practical Guidance
 
-## TODOs
-
-Near-term follow-ups that would materially improve `v3`:
-
-- Replace more of the regex extraction path with schema-first parsing and stronger LLM-backed normalization.
-- Improve design-spec understanding for sensor format, wavelength sets, constraints, and exclusions.
-- Add richer run progress reporting from optimization checkpoints instead of only submitted/status/cancel semantics.
-- Make artifact summaries more structured and easier to scan in the UI.
-- Add a clearer active-lens and active-run UX so users do not need to infer session state from chat history.
-- Expand analysis outputs into more guided interpretation instead of only returning files plus a short summary.
-- Add better test coverage around routing, argument refinement, and state transitions.
-- Normalize and clean some user-facing strings and encoding artifacts in responses.
-- Decide whether `v1/` and `v2/` should remain as historical references or be retired from the package docs entirely.
+If you want the smoothest experience:
+- Upload a `.json` or `.zmx` lens before asking for analysis or optimization.
+- Be explicit with `fov` and `fnum` when creating a new lens.
+- If you care about layout, specify `surf_list` directly.
+- Ask to `send`, `show`, `download`, or `export` when you want files delivered back into the UI.
+- Use the run id explicitly when checking or canceling a non-active optimization run.

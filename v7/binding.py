@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from .field_specs import describe_missing_fields
 from .tool_registry import get_tool_spec
 from .types import BindingResult, BoundAction, DeepLensTask, PlanStep, RuntimeState, ToolSpec
 
@@ -93,10 +94,6 @@ def _missing_paths(spec: ToolSpec, resolved_args: dict[str, Any]) -> list[str]:
     return missing
 
 
-def _normalize_missing_name(path: str) -> str:
-    return path.split(".")[-1]
-
-
 def resolve_step_args(step: PlanStep, task: DeepLensTask, state: RuntimeState) -> dict[str, Any]:
     spec = get_tool_spec(step.tool_name)
     args = _merge_dict(spec.defaults, _task_inputs(task, state))
@@ -111,16 +108,20 @@ def resolve_step_args(step: PlanStep, task: DeepLensTask, state: RuntimeState) -
 def bind_step(step: PlanStep, task: DeepLensTask, state: RuntimeState) -> BindingResult:
     spec = get_tool_spec(step.tool_name)
     resolved_args = resolve_step_args(step, task, state)
-    missing = [_normalize_missing_name(path) for path in _missing_paths(spec, resolved_args)]
+    missing = _missing_paths(spec, resolved_args)
+    missing_details = describe_missing_fields(missing)
     if missing:
+        labels = [item.label for item in missing_details]
         return BindingResult(
             ok=False,
             missing_fields=missing,
-            message=f"Missing required input: {', '.join(missing)}.",
+            missing_field_details=missing_details,
+            message=f"Missing required input: {', '.join(labels or missing)}.",
             resolved_args=resolved_args,
         )
     return BindingResult(
         ok=True,
         action=BoundAction(step_id=step.step_id, tool_name=step.tool_name, args=resolved_args, missing_fields=[]),
+        missing_field_details=[],
         resolved_args=resolved_args,
     )

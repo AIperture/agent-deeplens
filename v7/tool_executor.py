@@ -12,7 +12,6 @@ from .backend import (
     export_lens,
     load_text_or_json_payload,
     maybe_extract_filename,
-    missing_design_fields,
     persist_output_files,
     resolve_lens_source,
     run_analysis,
@@ -387,15 +386,6 @@ async def _exec_dl_analysis(*, resolved_inputs: dict[str, Any], task: Any, state
 
 async def _exec_dl_create_lens(*, resolved_inputs: dict[str, Any], state: RuntimeState, context: Any, **_: Any) -> ToolResult:
     spec = resolved_inputs.get("design_spec") or {}
-    missing = missing_design_fields(spec)
-    if missing:
-        return ToolResult(
-            ok=False,
-            tool_name="dl.create_lens",
-            summary=f"Missing required design fields: {', '.join(missing)}.",
-            error_type=ErrorType.MISSING_INPUT.value,
-            error_message=f"Missing required design fields: {', '.join(missing)}.",
-        )
     try:
         created = await create_lens_design(resolved_inputs=resolved_inputs, context=context)
     except Exception as exc:

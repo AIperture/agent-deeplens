@@ -4,12 +4,13 @@ import json
 import logging
 from typing import Any
 
-from v3.extraction import (
+from .field_specs import render_parse_contract, tool_parse_hints
+from .parse import (
     attachment_suggests_lens,
-    extract_analysis_request,
-    extract_design_spec,
-    extract_run_request,
-    infer_export_formats,
+    build_extraction_schema,
+    extract_deterministic_inputs,
+    merge_task_update,
+    parse_llm_json_response,
 )
 from .policies import should_plan_artifact_delivery
 from .tool_registry import get_tool_spec
@@ -66,60 +67,19 @@ def _infer_capabilities(message: str, attachments: list[dict[str, Any]], state: 
 
 def _heuristic_task(message: str, attachments: list[dict[str, Any]], state: RuntimeState) -> DeepLensTask:
     capabilities = _infer_capabilities(message, attachments, state)
-    design_spec = extract_design_spec(message)
-    analysis_request = extract_analysis_request(message, attachments)
-    run_request = extract_run_request(message)
-    delivery_request = {"formats": infer_export_formats(message, None)}
-    lens_source = {}
-    if attachments:
-        first = attachments[0]
-        lens_source = {
-            "artifact_id": first.get("artifact_id"),
-            "uri": first.get("uri"),
-            "name": first.get("name") or first.get("filename"),
-        }
+    evidence = extract_deterministic_inputs(message=message, attachments=attachments, state=state)
     response_request = {"mode": "explain" if capabilities == ["explain"] else "workflow"}
     return DeepLensTask(
         user_goal=message,
         attachments=list(attachments),
         requested_capabilities=capabilities,
-        design_spec=design_spec,
-        analysis_request=analysis_request,
-        run_request=run_request,
-        delivery_request=delivery_request,
-        lens_source=lens_source,
+        design_spec=dict(evidence["design_spec"]),
+        analysis_request=dict(evidence["analysis_request"]),
+        run_request=dict(evidence["run_request"]),
+        delivery_request=dict(evidence["delivery_request"]),
+        lens_source=dict(evidence["lens_source"]),
         response_request=response_request,
     )
-
-
-def _task_schema() -> dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {
-            "requested_capabilities": {
-                "type": "array",
-                "items": {
-                    "type": "string",
-                    "enum": ["design", "analysis", "optimize", "export", "status", "cancel", "explain"],
-                },
-            },
-            "design_spec_json": {"type": "string"},
-            "analysis_request_json": {"type": "string"},
-            "run_request_json": {"type": "string"},
-            "delivery_request_json": {"type": "string"},
-            "response_mode": {"type": "string", "enum": ["workflow", "explain"]},
-        },
-        "required": [
-            "requested_capabilities",
-            "design_spec_json",
-            "analysis_request_json",
-            "run_request_json",
-            "delivery_request_json",
-            "response_mode",
-        ],
-        "additionalProperties": False,
-    }
-
 
 async def build_task(message: str, attachments: list[dict[str, Any]], state: RuntimeState, context: Any) -> DeepLensTask:
     fallback = _heuristic_task(message, attachments, state)
@@ -132,11 +92,13 @@ async def build_task(message: str, attachments: list[dict[str, Any]], state: Run
         separator="\n\n",
         fallback_keys=["deeplens.system", "deeplens.parse"],
     )
+    system_prompt = f"{system_prompt}\n\n{render_parse_contract()}"
     payload = {
         "message": message,
         "attachments": attachments,
         "active_source_ref": state.active_source_ref,
         "active_run_id": state.active_run_id,
+        "tool_parse_hints": tool_parse_hints(),
     }
     try:
         response, _usage = await llm.chat(
@@ -145,34 +107,21 @@ async def build_task(message: str, attachments: list[dict[str, Any]], state: Run
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
             output_format="json_schema",
-            json_schema=_task_schema(),
+            json_schema=build_extraction_schema(include_capabilities=True),
             schema_name="DeepLensV7Task",
             strict_schema=True,
             validate_json=True,
             max_output_tokens=500,
         )
-        obj = json.loads(response) if isinstance(response, str) else response
-        task = DeepLensTask.from_dict(fallback.to_dict()) or fallback
-        task.requested_capabilities = list(obj.get("requested_capabilities") or fallback.requested_capabilities)
-        task.response_request = {"mode": str(obj.get("response_mode") or "workflow")}
-        for attr, key in (
-            ("design_spec", "design_spec_json"),
-            ("analysis_request", "analysis_request_json"),
-            ("run_request", "run_request_json"),
-            ("delivery_request", "delivery_request_json"),
-        ):
-            raw = obj.get(key) or "{}"
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                setattr(task, attr, parsed)
-        if attachments and not task.lens_source:
-            first = attachments[0]
-            task.lens_source = {
-                "artifact_id": first.get("artifact_id"),
-                "uri": first.get("uri"),
-                "name": first.get("name") or first.get("filename"),
-            }
-        return task
+        llm_payload = parse_llm_json_response(response)
+        return merge_task_update(
+            base_task=fallback,
+            deterministic=extract_deterministic_inputs(message=message, attachments=attachments, state=state),
+            llm_payload=llm_payload,
+            attachments=[],
+            state=state,
+            include_capabilities=True,
+        )
     except Exception:
         logger.warning("deeplens_v7: task extraction llm failed; using heuristic fallback", exc_info=True)
         return fallback

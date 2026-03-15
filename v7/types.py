@@ -180,6 +180,31 @@ class ToolSpec:
 
 
 @dataclass
+class FieldSpec:
+    path: str
+    bucket: str
+    label: str
+    help_text: str = ""
+    examples: list[str] = field(default_factory=list)
+    value_type: str = "string"
+    enum_values: list[str] = field(default_factory=list)
+    extract_from_text: bool = True
+    extract_from_attachments: bool = False
+    extract_from_state: bool = False
+    tool_names: list[str] = field(default_factory=list)
+    has_default: bool = False
+    default_value: Any = None
+
+
+@dataclass
+class MissingFieldInfo:
+    path: str
+    label: str
+    help_text: str = ""
+    examples: list[str] = field(default_factory=list)
+
+
+@dataclass
 class BoundAction:
     step_id: str
     tool_name: str
@@ -192,6 +217,7 @@ class BindingResult:
     ok: bool
     action: BoundAction | None = None
     missing_fields: list[str] = field(default_factory=list)
+    missing_field_details: list[MissingFieldInfo] = field(default_factory=list)
     message: str = ""
     resolved_args: dict[str, Any] = field(default_factory=dict)
 

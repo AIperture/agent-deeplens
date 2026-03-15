@@ -50,7 +50,7 @@ Extract the current DeepLens task from the user message.
 Rules:
 - Prefer workflow execution unless the user is clearly asking for explanation only.
 - Fill `requested_capabilities` using only: `design`, `analysis`, `optimize`, `export`, `status`, `cancel`, `explain`.
-- Return JSON strings for design spec, analysis request, run request, and delivery request.
+- Return JSON objects for `design_spec`, `analysis_request`, `run_request`, and `delivery_request`.
 - Do not invent lens files, artifact ids, or run ids.
 
 ## deeplens.parse
@@ -59,7 +59,7 @@ Parse a short user reply that provides missing workflow inputs.
 
 Rules:
 - Only extract fields that are clearly present.
-- Return JSON objects for design spec, analysis request, run request, and delivery request.
+- Return sparse JSON objects for `design_spec`, `analysis_request`, `run_request`, and `delivery_request`.
 - Do not invent lens files, artifact ids, or run ids.
 
 ## deeplens.style

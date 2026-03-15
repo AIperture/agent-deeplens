@@ -48,7 +48,8 @@ def _plan_summary(task: DeepLensTask, plan: Plan, state: RuntimeState) -> str:
         # lines.append("Args:")
         # lines.append(args_json)
         if binding.missing_fields:
-            lines.append(f"Missing before execution: {', '.join(binding.missing_fields)}")
+            labels = [item.label for item in binding.missing_field_details]
+            lines.append(f"Missing before execution: {', '.join(labels or binding.missing_fields)}")
     return "\n".join(lines)
 
 
@@ -115,7 +116,9 @@ async def run_loop(
         binding = bind_step(step, task, state)
         if not binding.ok:
             reply_text, files = await ask_for_missing_inputs(
+                tool_name=step.tool_name,
                 missing_fields=binding.missing_fields,
+                missing_details=binding.missing_field_details,
                 task=task,
                 context=context,
             )
@@ -123,6 +126,8 @@ async def run_loop(
                 task=task,
                 text=reply_text,
                 attachments=files,
+                missing_fields=binding.missing_fields,
+                state=state,
                 context=context,
             )
             state.active_task = task.to_dict()
@@ -165,7 +170,9 @@ async def run_loop(
         await _emit_tool_phase(step=step, status="failed", context=context)
         if result.error_type == ErrorType.MISSING_INPUT.value:
             reply_text, files = await ask_for_missing_inputs(
+                tool_name=step.tool_name,
                 missing_fields=binding.missing_fields or step.required_fields or ["lens_source"],
+                missing_details=binding.missing_field_details,
                 task=task,
                 context=context,
             )
@@ -173,6 +180,8 @@ async def run_loop(
                 task=task,
                 text=reply_text,
                 attachments=files,
+                missing_fields=binding.missing_fields or step.required_fields or ["lens_source"],
+                state=state,
                 context=context,
             )
             state.active_task = task.to_dict()
