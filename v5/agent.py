@@ -1,21 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 from typing import Any
 
 from aethergraph import NodeContext, graph_fn
 
-from .loop_engine import run_loop
-from .memory_policy import build_context_bundle, maybe_distill_session_summary
-from .router import route
-from .types import TaskShape, load_state, save_state
+from .interpreter import interpret_turn
+from .loop_engine import run_task_loop
+from .response_compose import compose_reply
+from .state import append_trace, set_active_task, set_pending_interaction
+from .types import ConversationState, TurnRole, load_state, save_state
 
 
-def _roll_loop_history(state: Any) -> None:
-    """
-    Archive the tail of the current loop trace and pending runs into loop history, then trim the history to a manageable length.
-    This helps maintain context across task iterations while preventing unbounded growth of the trace and pending runs. The specific lengths to keep can be adjusted based on typical trace sizes and memory constraints.   
-    """
+def _roll_loop_history(state: ConversationState) -> None:
+    """Archive the tail of the current loop trace into loop history, then reset per-loop state."""
     if not state.active_task and not state.loop_trace:
         return
     archived = {
@@ -30,6 +27,72 @@ def _roll_loop_history(state: Any) -> None:
     state.pending_action = None
     state.pending_approval = None
     state.active_plan = None
+
+
+async def run_agent_turn(
+    *,
+    message: str,
+    attachments: list[dict[str, Any]] | None,
+    context: Any,
+    user_meta: dict[str, Any] | None = None,
+) -> str:
+    state = await load_state(context, level="session")
+    state.last_user_turn = (message or "").strip()
+
+    try:
+        await context.memory().record_chat_user(
+            text=state.last_user_turn,
+            tags=["ag.deeplens.v5.user"],
+            data={"attachments_count": len(attachments or [])},
+        )
+    except Exception:
+        context.logger().warning("deeplens_v5: failed to record user chat turn", exc_info=True)
+
+    decision = await interpret_turn(
+        message=message,
+        attachments=attachments,
+        state=state,
+        context=context,
+        user_meta=user_meta,
+    )
+    print(f"🍎 Interpretation decision: {decision}")
+    append_trace(state, "agent.interpreter_decision", turn_role=decision.turn_role.value)
+
+    if decision.turn_role in {TurnRole.DIRECT_REPLY, TurnRole.CONTROL_OR_META}:
+        reply = decision.direct_reply or "I am not sure how to help with that yet."
+        await save_state(context, state)
+        return reply
+
+    if decision.clear_pending_interaction:
+        set_pending_interaction(state, None)
+
+    # Archive prior loop trace before starting a new task (matches v3 behavior).
+    if decision.turn_role == TurnRole.NEW_TASK:
+        _roll_loop_history(state)
+
+    if decision.task is not None:
+        set_active_task(state, decision.task)
+
+    active_task = state.get_active_task()
+    if active_task is None:
+        reply = "I could not determine an active task to run."
+        await save_state(context, state)
+        return reply
+
+    outcome = await run_task_loop(
+        task=active_task,
+        state=state,
+        context=context,
+    )
+    set_active_task(state, outcome.task_snapshot)
+
+    reply = await compose_reply(
+        outcome=outcome,
+        state=state,
+        context=context,
+    )
+    await save_state(context, state)
+    return reply
 
 
 @graph_fn(
@@ -66,6 +129,8 @@ async def deeplens_agent(
     *,
     context: NodeContext,
 ) -> dict[str, str]:
+    del session_id
+
     raw_message = (message or "").strip()
     attachments = attachments or []
     if not raw_message and not attachments:
@@ -77,55 +142,11 @@ async def deeplens_agent(
             )
         }
 
-    mem = context.memory()
-    chan = context.channel("ui:session")
-    state = await load_state(context=context, level="session")
-
-    await mem.record_chat_user(
-        text=raw_message,
-        tags=["ag.deeplens.v3.user"],
-        data={"attachments_count": len(attachments)},
-    )
-
-    route_result = await route(
+    reply = await run_agent_turn(
         message=raw_message,
         attachments=attachments,
-        state=state,
         context=context,
         user_meta=user_meta,
     )
-    decision = route_result["decision"]
-    state = route_result["state"]
-
-    if route_result["immediate_reply"]:
-        reply = route_result["immediate_reply"] or ""
-    elif decision["task_shape"] == TaskShape.UNSUPPORTED:
-        reply = (
-            "This DeepLens agent currently supports lens analysis, starting-point lens design, "
-            "background optimization submission, run status or cancellation, and bounded optics interpretation."
-        )
-    else:
-        _roll_loop_history(state)
-        state.context_mode = decision["context_mode"].value
-        state.active_task = asdict(decision["task"])
-        await save_state(context=context, state=state)
-        await maybe_distill_session_summary(context)
-        context_bundle = await build_context_bundle(
-            context_mode=decision["context_mode"],
-            task=decision["task"],
-            state=state,
-            context=context,
-        )
-        out = await run_loop(
-            task=decision["task"],
-            state=state,
-            context_bundle=context_bundle,
-            context_mode=decision["context_mode"],
-            context=context,
-        )
-        reply = out["reply"]
-        state = out.get("state", state)
-
-    await chan.send_text(reply)
-    await save_state(context=context, state=state)
+    await context.channel("ui:session").send_text(reply)
     return {"reply": reply}

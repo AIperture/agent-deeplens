@@ -5,21 +5,21 @@ from typing import Any
 
 from aethergraph import NodeContext, graph_fn
 
-from .loop_engine import run_loop
-from .memory_policy import build_context_bundle, maybe_distill_session_summary
-from .router import route
-from .types import TaskShape, load_state, save_state
+from .context_policy import build_context_bundle
+from .controller_select import select_controller
+from .controllers.direct_controller import run_direct_controller
+from .controllers.workflow_controller import run_workflow_controller
+from .interpretation import interpret_turn
+from .types import ContextPolicy, ControllerKind, DeepLensState, TaskShape, load_state, save_state
 
 
-def _roll_loop_history(state: Any) -> None:
-    """
-    Archive the tail of the current loop trace and pending runs into loop history, then trim the history to a manageable length.
-    This helps maintain context across task iterations while preventing unbounded growth of the trace and pending runs. The specific lengths to keep can be adjusted based on typical trace sizes and memory constraints.   
-    """
-    if not state.active_task and not state.loop_trace:
+def _roll_loop_history(state: DeepLensState) -> None:
+    active_task_like = state.active_task_frame or state.active_execution
+    if not active_task_like and not state.loop_trace:
         return
     archived = {
-        "task": state.active_task,
+        "task_frame": state.active_task_frame,
+        "execution": state.active_execution,
         "trace_tail": state.loop_trace[-8:],
         "pending_runs_tail": state.pending_runs[-3:],
     }
@@ -32,6 +32,37 @@ def _roll_loop_history(state: Any) -> None:
     state.active_plan = None
 
 
+def _mode_command_policy(command: str | None) -> ContextPolicy | None:
+    if command == "/mode full":
+        return ContextPolicy.FULL
+    if command == "/mode lite":
+        return ContextPolicy.TASK_LOCAL
+    return None
+
+
+async def _dispatch_controller(
+    *,
+    controller_kind: ControllerKind,
+    interpretation: Any,
+    state: DeepLensState,
+    context_bundle: Any,
+    context: NodeContext,
+) -> dict[str, Any]:
+    if controller_kind == ControllerKind.DIRECT:
+        return await run_direct_controller(
+            interpretation=interpretation,
+            state=state,
+            context_bundle=context_bundle,
+            context=context,
+        )
+    return await run_workflow_controller(
+        interpretation=interpretation,
+        state=state,
+        context_bundle=context_bundle,
+        context=context,
+    )
+
+
 @graph_fn(
     name="deeplens_agent",
     inputs=["message", "attachments", "session_id", "user_meta"],
@@ -41,7 +72,7 @@ def _roll_loop_history(state: Any) -> None:
         "title": "DeepLens Assistant",
         "short_description": "Workflow-first DeepLens agent for design, analysis, and background optimization.",
         "description": (
-            "A loop-based DeepLens assistant that analyzes uploaded lens files, "
+            "A semantic-first DeepLens assistant that analyzes uploaded lens files, "
             "creates starting lens designs, exports outputs, and submits long-running "
             "optimization workflows through the AG runner."
         ),
@@ -66,8 +97,10 @@ async def deeplens_agent(
     *,
     context: NodeContext,
 ) -> dict[str, str]:
+    del session_id
     raw_message = (message or "").strip()
     attachments = attachments or []
+
     if not raw_message and not attachments:
         return {
             "reply": (
@@ -83,44 +116,48 @@ async def deeplens_agent(
 
     await mem.record_chat_user(
         text=raw_message,
-        tags=["ag.deeplens.v3.user"],
+        tags=["ag.deeplens.v4.user"],
         data={"attachments_count": len(attachments)},
     )
 
-    route_result = await route(
+    interpretation = await interpret_turn(
         message=raw_message,
         attachments=attachments,
         state=state,
-        context=context,
         user_meta=user_meta,
+        context=context,
     )
-    decision = route_result["decision"]
-    state = route_result["state"]
+    print("INTERPRETATION", interpretation)
+    task_frame = interpretation.task_frame
+    execution = interpretation.execution
 
-    if route_result["immediate_reply"]:
-        reply = route_result["immediate_reply"] or ""
-    elif decision["task_shape"] == TaskShape.UNSUPPORTED:
+    mode_override = _mode_command_policy(interpretation.envelope.explicit_command)
+    if mode_override is not None:
+        state.context_policy = mode_override.value
+
+    if interpretation.immediate_reply:
+        state.active_task_frame = asdict(task_frame)
+        state.active_execution = asdict(execution) if execution else None
+        reply = interpretation.immediate_reply
+    elif task_frame.task_shape == TaskShape.UNSUPPORTED:
+        state.active_task_frame = asdict(task_frame)
+        state.active_execution = asdict(execution) if execution else None
         reply = (
             "This DeepLens agent currently supports lens analysis, starting-point lens design, "
             "background optimization submission, run status or cancellation, and bounded optics interpretation."
         )
     else:
         _roll_loop_history(state)
-        state.context_mode = decision["context_mode"].value
-        state.active_task = asdict(decision["task"])
+        state.active_task_frame = asdict(task_frame)
+        state.active_execution = asdict(execution) if execution else None
         await save_state(context=context, state=state)
-        await maybe_distill_session_summary(context)
-        context_bundle = await build_context_bundle(
-            context_mode=decision["context_mode"],
-            task=decision["task"],
-            state=state,
-            context=context,
-        )
-        out = await run_loop(
-            task=decision["task"],
+        context_bundle = await build_context_bundle(task=task_frame, state=state, context=context)
+        controller_kind = select_controller(task_frame)
+        out = await _dispatch_controller(
+            controller_kind=controller_kind,
+            interpretation=interpretation,
             state=state,
             context_bundle=context_bundle,
-            context_mode=decision["context_mode"],
             context=context,
         )
         reply = out["reply"]
