@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -19,6 +20,13 @@ from .backend import (
     summarize_status,
 )
 from .types import ErrorType, RuntimeState, ToolResult
+from .workflows import (
+    OPTIMIZE_LAUNCHER_GRAPH_ID,
+    OPTIMIZE_LEGACY_GRAPH_ID,
+    _generated_graph_id,
+    _plan_optimization_intervals,
+    build_generated_optimize_graph,
+)
 
 
 logger = logging.getLogger("ag.deeplens.v7.tool_executor")
@@ -183,16 +191,59 @@ async def _exec_dl_optimize(*, resolved_inputs: dict[str, Any], task: Any, state
             )
         except Exception:
             logger.warning("dl.optimize: resolve_lens_source failed, using fallback", exc_info=True)
-    graph_id = str(resolved_inputs.get("graph_id") or "deeplens_v7_optimize_workflow")
+    requested_graph_id = str(resolved_inputs.get("graph_id") or OPTIMIZE_LAUNCHER_GRAPH_ID)
     graph_inputs = build_optimization_inputs(
         resolved_inputs=resolved_inputs,
         task=task,
         source=source,
         state=state,
     )
+    if requested_graph_id in {"", OPTIMIZE_LAUNCHER_GRAPH_ID, OPTIMIZE_LEGACY_GRAPH_ID}:
+        graph_id = _generated_graph_id(
+            request=graph_inputs,
+            parent_run_id=getattr(context, "run_id", None),
+        )
+        generated_graph = build_generated_optimize_graph(graph_id=graph_id, request=graph_inputs)
+        generated_spec = copy.deepcopy(generated_graph.spec)
+
+        def _build():
+            from aethergraph.core.graph.task_graph import TaskGraph
+
+            return TaskGraph.from_spec(copy.deepcopy(generated_spec), state=None)
+
+        _build.__ag_builder__ = True
+        _build.build = _build
+        _build.graph_name = graph_id
+        _build.version = "0.1.0"
+
+        context.registry().register(
+            nspace="graph",
+            name=graph_id,
+            version="0.1.0",
+            obj=_build,
+            meta={
+                "kind": "graph",
+                "flow_id": OPTIMIZE_LAUNCHER_GRAPH_ID,
+                "tags": ["ag.deeplens.v7", "workflow:optimization", "generated"],
+                "description": "Per-request generated DeepLens optimization graph.",
+                "inputs": [],
+                "outputs": ["summary", "result_artifact_id", "result_json", "result_dir"],
+                "interval_count": len(
+                    _plan_optimization_intervals(
+                        iterations=int(graph_inputs.get("iterations") or 0),
+                        checkpoint_every=int(graph_inputs.get("checkpoint_every") or 1),
+                    )
+                ),
+                "generated_request": copy.deepcopy(graph_inputs),
+            },
+        )
+        run_inputs: dict[str, Any] = {}
+    else:
+        graph_id = requested_graph_id
+        run_inputs = graph_inputs
     run_id = await context.runner().spawn_run(
         graph_id,
-        inputs=graph_inputs,
+        inputs=run_inputs,
         tags=["ag.deeplens.v7", "workflow:optimization"],
     )
     _record_pending_run(state, run_id, graph_id, meta={"source_action": "dl.optimize"})

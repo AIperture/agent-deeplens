@@ -57,7 +57,7 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         required_args=[],
         optional_args=["graph_id", "lens_source", "run_request", "use_stub"],
         defaults={
-            "graph_id": "deeplens_v7_optimize_workflow",
+            "graph_id": "deeplens_v7_optimize_launcher",
             "run_request": {
                 "goal": "",
                 "constraints": [],

@@ -1,18 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
-from aethergraph import NodeContext, graphify, tool
+from aethergraph import NodeContext, graph_fn, graphify, tool
+from aethergraph.core.graph.graph_builder import graph
+from aethergraph.core.graph.task_graph import TaskGraph
 
 from .backend import _artifact_to_ref, _import_deeplens, resolve_lens_source
 
 DEFAULT_EXPORT_FORMATS = ["json", "zmx"]
 OPTIMIZE_VIZ_FIGURE = "deeplens_optimize"
+OPTIMIZE_LENS_FIGURE = "deeplens_lens"
 OPTIMIZE_IMAGE_TRACK = "optimization_preview"
 OPTIMIZE_RESUME_KEY_PREFIX = "deeplens_v7_optimize_resume"
+OPTIMIZE_LAUNCHER_GRAPH_ID = "deeplens_v7_optimize_launcher"
+OPTIMIZE_LEGACY_GRAPH_ID = "deeplens_v7_optimize_workflow"
+OPTIMIZE_GENERATED_GRAPH_PREFIX = "deeplens_v7_optimize_run"
 
 
 def _json_dumps(payload: Any) -> str:
@@ -49,6 +57,27 @@ def _normalize_request(
         "export_formats": export_formats or list(DEFAULT_EXPORT_FORMATS),
         "use_stub": bool(use_stub),
     }
+
+
+def _plan_optimization_intervals(*, iterations: int, checkpoint_every: int) -> list[tuple[int, int]]:
+    total_iterations = max(0, int(iterations or 0))
+    interval_size = max(1, int(checkpoint_every or 1))
+    if total_iterations <= 0:
+        return [(0, 0)]
+
+    intervals: list[tuple[int, int]] = []
+    start_iteration = 0
+    while start_iteration < total_iterations:
+        end_iteration = min(total_iterations, start_iteration + interval_size)
+        intervals.append((start_iteration, end_iteration))
+        start_iteration = end_iteration
+    return intervals
+
+
+def _generated_graph_id(*, request: dict[str, Any], parent_run_id: str | None = None) -> str:
+    request_hash = hashlib.sha1(_json_dumps(request).encode("utf-8")).hexdigest()[:10]
+    run_suffix = (str(parent_run_id or "local").replace("-", "_"))[-12:]
+    return f"{OPTIMIZE_GENERATED_GRAPH_PREFIX}_{run_suffix}_{request_hash}"
 
 
 def _resume_key(context: NodeContext) -> str:
@@ -141,7 +170,7 @@ async def _emit_checkpoint_viz(
                 OPTIMIZE_IMAGE_TRACK,
                 step=step,
                 artifact=image_artifact,
-                figure_id=OPTIMIZE_VIZ_FIGURE,
+                figure_id=OPTIMIZE_LENS_FIGURE,
                 mode="replace",
                 meta={
                     "filename": latest_image.get("name"),
@@ -456,6 +485,220 @@ async def load_lens_for_optimization(
             tool_name=tool_name,
             status="failed",
             label="Lens load failed",
+            detail=str(exc),
+        )
+        raise
+
+
+@tool(
+    outputs=[
+        "run_state_json",
+        "latest_checkpoint_artifact",
+        "latest_iteration",
+        "result_dir",
+        "metrics_json",
+    ]
+)
+async def run_optimization_interval(
+    source_json: str,
+    request_json: str,
+    prior_run_state_json: str = "",
+    start_iteration: int = 0,
+    end_iteration: int = 0,
+    is_stub: bool = False,
+    *,
+    context: NodeContext,
+) -> dict[str, Any]:
+    tool_name = "run_optimization_interval"
+    request = _json_loads(request_json, {})
+    source_payload = _json_loads(source_json, {})
+    prior_state = _json_loads(prior_run_state_json, {})
+    total_iterations = int(request.get("iterations") or 0)
+    start_iteration = max(0, int(start_iteration or 0))
+    end_iteration = max(start_iteration, int(end_iteration or 0))
+    goal = str(request.get("goal") or "optimize lens")
+
+    await _send_tool_phase(
+        context,
+        tool_name=tool_name,
+        status="active",
+        label="Optimizing lens",
+        detail=f"Running interval {start_iteration}-{end_iteration} for goal: {goal}.",
+    )
+
+    try:
+        if is_stub:
+            run_state = dict(prior_state)
+            run_state.setdefault("mode", "stub")
+            run_state.setdefault(
+                "summary",
+                "Completed stub DeepLens optimization workflow.",
+            )
+            run_state["latest_iteration"] = end_iteration
+            run_state.setdefault("result_dir", "")
+            run_state.setdefault("persisted_files", [])
+            run_state.setdefault("source", source_payload.get("source") or {})
+            run_state.setdefault("latest_metrics", {})
+            if end_iteration >= total_iterations:
+                summary_artifact = await context.artifacts().save_text(
+                    f"Stub optimization finished for goal: {goal}",
+                    name="deeplens-optimize-summary.txt",
+                    labels={"workflow": "optimize", "stub": True},
+                )
+                run_state["result_artifact"] = _artifact_to_ref(summary_artifact)
+                run_state["preferred_result_artifact"] = _artifact_to_ref(summary_artifact)
+            await _send_tool_phase(
+                context,
+                tool_name=tool_name,
+                status="done",
+                label="Interval finished",
+                detail=f"Stub interval completed at iteration {end_iteration}.",
+            )
+            return {
+                "run_state_json": _json_dumps(run_state),
+                "latest_checkpoint_artifact": _json_dumps(
+                    run_state.get("latest_checkpoint_artifact") or {}
+                ),
+                "latest_iteration": end_iteration,
+                "result_dir": str(run_state.get("result_dir") or ""),
+                "metrics_json": _json_dumps(run_state.get("latest_metrics") or {}),
+            }
+
+        base_source = dict(source_payload.get("source") or {})
+        active_source = dict(prior_state.get("latest_checkpoint_artifact") or base_source)
+        resolved_source = await resolve_lens_source(
+            resolved_inputs={"lens_source": active_source},
+            context=context,
+            active_source_ref=active_source,
+        )
+        lens, resolved_source = await asyncio.to_thread(_load_lens_sync, resolved_source)
+
+        result_dir_text = str(
+            prior_state.get("result_dir") or await context.artifacts().stage_dir("_deeplens_optimize")
+        )
+        result_dir = Path(result_dir_text)
+        result_dir.mkdir(parents=True, exist_ok=True)
+
+        persisted_files = set(str(item) for item in (prior_state.get("persisted_files") or []))
+        latest_metrics: dict[str, float] = dict(prior_state.get("latest_metrics") or {})
+        latest_checkpoint_artifact = dict(prior_state.get("latest_checkpoint_artifact") or {})
+
+        if start_iteration <= 0 and not latest_checkpoint_artifact:
+            checkpoint_bundle = await asyncio.to_thread(
+                _prepare_checkpoint_bundle,
+                lens=lens,
+                checkpoint_iteration=0,
+                result_dir=str(result_dir),
+            )
+            new_artifacts, persisted_files = await _persist_new_output_files(
+                result_dir=result_dir,
+                context=context,
+                tag="optimize",
+                persisted_files=persisted_files,
+            )
+            await _emit_checkpoint_viz(
+                context=context,
+                step=0,
+                total_iterations=total_iterations,
+                metrics=None,
+                new_artifacts=new_artifacts,
+            )
+            latest_checkpoint_artifact = next(
+                (artifact for artifact in new_artifacts if str(artifact.get("name")) == "iter0.json"),
+                latest_checkpoint_artifact,
+            )
+        else:
+            checkpoint_bundle = await asyncio.to_thread(
+                _prepare_checkpoint_bundle,
+                lens=lens,
+                checkpoint_iteration=start_iteration,
+                result_dir=str(result_dir),
+            )
+
+        optimizer, scheduler = await asyncio.to_thread(
+            _build_optimizer_state,
+            lens=lens,
+            iterations=total_iterations,
+            start_iteration=start_iteration,
+        )
+
+        for iteration in range(max(1, start_iteration + 1), end_iteration + 1):
+            latest_metrics = await asyncio.to_thread(
+                _run_training_step,
+                lens=lens,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                rays_backup=checkpoint_bundle["rays_backup"],
+                center_ref=checkpoint_bundle["center_ref"],
+            )
+
+        checkpoint_bundle = await asyncio.to_thread(
+            _prepare_checkpoint_bundle,
+            lens=lens,
+            checkpoint_iteration=end_iteration,
+            result_dir=str(result_dir),
+        )
+        new_artifacts, persisted_files = await _persist_new_output_files(
+            result_dir=result_dir,
+            context=context,
+            tag="optimize",
+            persisted_files=persisted_files,
+        )
+        latest_checkpoint_artifact = next(
+            (
+                artifact
+                for artifact in new_artifacts
+                if str(artifact.get("name")) == f"iter{end_iteration}.json"
+            ),
+            latest_checkpoint_artifact,
+        )
+        await _emit_checkpoint_viz(
+            context=context,
+            step=end_iteration,
+            total_iterations=total_iterations,
+            metrics=latest_metrics,
+            new_artifacts=new_artifacts,
+        )
+
+        progress_payload = {
+            "goal": goal,
+            "iterations": total_iterations,
+            "checkpoint_every": int(request.get("checkpoint_every") or 1),
+            "latest_iteration": end_iteration,
+            "metrics": latest_metrics,
+            "source": resolved_source,
+        }
+        await asyncio.to_thread(_write_json, result_dir / "optimization_progress.json", progress_payload)
+
+        run_state = {
+            "result_dir": str(result_dir),
+            "latest_iteration": end_iteration,
+            "latest_checkpoint_artifact": latest_checkpoint_artifact,
+            "preferred_result_artifact": latest_checkpoint_artifact,
+            "persisted_files": sorted(persisted_files),
+            "latest_metrics": latest_metrics,
+            "source": resolved_source,
+        }
+        await _send_tool_phase(
+            context,
+            tool_name=tool_name,
+            status="done",
+            label="Interval finished",
+            detail=f"Completed optimization interval {start_iteration}-{end_iteration}.",
+        )
+        return {
+            "run_state_json": _json_dumps(run_state),
+            "latest_checkpoint_artifact": _json_dumps(latest_checkpoint_artifact),
+            "latest_iteration": end_iteration,
+            "result_dir": str(result_dir),
+            "metrics_json": _json_dumps(latest_metrics),
+        }
+    except Exception as exc:
+        await _send_tool_phase(
+            context,
+            tool_name=tool_name,
+            status="failed",
+            label="Interval failed",
             detail=str(exc),
         )
         raise
@@ -923,6 +1166,203 @@ async def finalize_optimization_result(
             detail=str(exc),
         )
         raise
+
+
+def build_generated_optimize_graph(
+    *,
+    graph_id: str,
+    request: dict[str, Any],
+) -> TaskGraph:
+    intervals = _plan_optimization_intervals(
+        iterations=int(request.get("iterations") or 0),
+        checkpoint_every=int(request.get("checkpoint_every") or 1),
+    )
+
+    with graph(name=graph_id) as g:
+        prepared = prepare_optimize_request(
+            lens_source=request.get("lens_source"),
+            goal=request.get("goal"),
+            constraints=request.get("constraints"),
+            excluded_objectives=request.get("excluded_objectives"),
+            iterations=int(request.get("iterations") or 0),
+            checkpoint_every=int(request.get("checkpoint_every") or 1),
+            export_formats=list(request.get("export_formats") or list(DEFAULT_EXPORT_FORMATS)),
+            use_stub=bool(request.get("use_stub")),
+            _id="prepare_optimize_request",
+        )
+        loaded = load_lens_for_optimization(
+            lens_source=request.get("lens_source"),
+            request_json=prepared.request_json,
+            is_stub=prepared.is_stub,
+            _after=[prepared],
+            _id="load_lens_for_optimization",
+        )
+
+        previous = None
+        for index, (start_iteration, end_iteration) in enumerate(intervals):
+            interval_node = run_optimization_interval(
+                source_json=loaded.source_json,
+                request_json=prepared.request_json,
+                prior_run_state_json="" if previous is None else previous.run_state_json,
+                start_iteration=start_iteration,
+                end_iteration=end_iteration,
+                is_stub=prepared.is_stub,
+                _after=[loaded] if previous is None else [previous],
+                _id=f"optimize_interval_{index:03d}",
+            )
+            previous = interval_node
+
+        if previous is None:
+            raise RuntimeError("Generated optimization graph requires at least one interval node.")
+
+        exported = export_optimized_lens(
+            source_json=loaded.source_json,
+            run_state_json=previous.run_state_json,
+            request_json=prepared.request_json,
+            is_stub=prepared.is_stub,
+            _after=[previous],
+            _id="export_optimized_lens",
+        )
+        finalized = finalize_optimization_result(
+            source_json=loaded.source_json,
+            run_state_json=exported.run_state_json,
+            request_json=prepared.request_json,
+            is_stub=prepared.is_stub,
+            _after=[exported],
+            _id="finalize_optimization_result",
+        )
+        g.expose("summary", finalized.summary)
+        g.expose("result_artifact_id", finalized.result_artifact_id)
+        g.expose("result_json", finalized.result_json)
+        g.expose("result_dir", finalized.result_dir)
+        g.spec.meta.update(
+            {
+                "generated_from": OPTIMIZE_LAUNCHER_GRAPH_ID,
+                "generated_request": copy.deepcopy(request),
+                "interval_count": len(intervals),
+                "iterations": int(request.get("iterations") or 0),
+                "checkpoint_every": int(request.get("checkpoint_every") or 1),
+            }
+        )
+        generated_graph = g
+
+    return generated_graph
+
+
+@graph_fn(
+    name=OPTIMIZE_LAUNCHER_GRAPH_ID,
+    inputs=[
+        "lens_source",
+        "goal",
+        "constraints",
+        "excluded_objectives",
+        "iterations",
+        "checkpoint_every",
+        "export_formats",
+        "use_stub",
+    ],
+    outputs=["summary", "result_artifact_id", "result_json", "result_dir"],
+)
+async def deeplens_v7_optimize_launcher(
+    lens_source: dict[str, Any] | None = None,
+    goal: str | None = None,
+    constraints: list[Any] | None = None,
+    excluded_objectives: list[Any] | None = None,
+    iterations: int = 500,
+    checkpoint_every: int = 100,
+    export_formats: list[str] | None = None,
+    use_stub: bool = False,
+    *,
+    context: NodeContext,
+) -> dict[str, Any]:
+    request = _normalize_request(
+        lens_source=lens_source,
+        goal=goal,
+        constraints=constraints,
+        excluded_objectives=excluded_objectives,
+        iterations=iterations,
+        checkpoint_every=checkpoint_every,
+        export_formats=export_formats,
+        use_stub=use_stub,
+    )
+    child_graph_id = _generated_graph_id(request=request, parent_run_id=context.run_id)
+    child_graph = build_generated_optimize_graph(graph_id=child_graph_id, request=request)
+    child_spec = copy.deepcopy(child_graph.spec)
+
+    def _build() -> TaskGraph:
+        return TaskGraph.from_spec(copy.deepcopy(child_spec), state=None)
+
+    _build.__ag_builder__ = True
+    _build.build = _build
+    _build.graph_name = child_graph_id
+    _build.version = "0.1.0"
+
+    context.registry().register(
+        nspace="graph",
+        name=child_graph_id,
+        version="0.1.0",
+        obj=_build,
+        meta={
+            "kind": "graph",
+            "flow_id": OPTIMIZE_LAUNCHER_GRAPH_ID,
+            "tags": ["ag.deeplens.v7", "workflow:optimization", "generated"],
+            "description": "Per-request generated DeepLens optimization graph.",
+            "inputs": [],
+            "outputs": ["summary", "result_artifact_id", "result_json", "result_dir"],
+            "interval_count": len(
+                _plan_optimization_intervals(
+                    iterations=int(request.get("iterations") or 0),
+                    checkpoint_every=int(request.get("checkpoint_every") or 1),
+                )
+            ),
+            "generated_request": copy.deepcopy(request),
+        },
+    )
+    child_run_id, outputs, has_waits, continuations = await context.runner().run_and_wait(
+        child_graph_id,
+        inputs={},
+        tags=["ag.deeplens.v7", "workflow:optimization", "generated"],
+    )
+    if has_waits:
+        wait_summary = (
+            f"Optimization child run `{child_run_id}` is waiting in `{child_graph_id}`."
+        )
+        return {
+            "summary": wait_summary,
+            "result_artifact_id": "",
+            "result_json": _json_dumps(
+                {
+                    "child_run_id": child_run_id,
+                    "child_graph_id": child_graph_id,
+                    "continuations": continuations,
+                }
+            ),
+            "result_dir": "",
+        }
+    if not outputs:
+        return {
+            "summary": f"Optimization child run `{child_run_id}` completed without outputs.",
+            "result_artifact_id": "",
+            "result_json": _json_dumps(
+                {"child_run_id": child_run_id, "child_graph_id": child_graph_id}
+            ),
+            "result_dir": "",
+        }
+    result = dict(outputs)
+    result.setdefault("result_json", "")
+    result["result_json"] = _json_dumps(
+        {
+            "child_run_id": child_run_id,
+            "child_graph_id": child_graph_id,
+            "result": _json_loads(str(result.get("result_json") or ""), result.get("result_json") or {}),
+        }
+    )
+    return {
+        "summary": str(result.get("summary") or ""),
+        "result_artifact_id": str(result.get("result_artifact_id") or ""),
+        "result_json": str(result.get("result_json") or ""),
+        "result_dir": str(result.get("result_dir") or ""),
+    }
 
 
 @graphify(
