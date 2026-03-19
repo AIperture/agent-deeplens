@@ -22,7 +22,6 @@ async def _emit_tool_phase(*, step: Any, status: str, context: Any) -> None:
         status=phase_status,
         label=step.title,
         detail=detail,
-        key_suffix=step.step_id,
     )
 
 

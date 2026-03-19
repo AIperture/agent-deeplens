@@ -219,7 +219,6 @@ async def _send_tool_phase(
     #     status=status,  # type: ignore[arg-type]
     #     label=label,
     #     detail=detail,
-    #     key_suffix=f"phase:tool:{tool_name}",
     # )
     # await asyncio.sleep(3)  # yield control to ensure the message is sent promptly
     print(f"🍎 [{context.run_id}] {label} - {detail}")
