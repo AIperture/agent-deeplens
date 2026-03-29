@@ -63,25 +63,23 @@ async def ask_for_missing_inputs(
 
 
 async def ask_for_approval(*, prompt: str, context: Any) -> bool:
-    response = await context.channel("ui:session").ask_approval(
+    approved, _choice, _choice_label, _text, _matched = await context.channel(
+        "ui:session"
+    ).ask_approval(
         prompt=prompt,
         options=["Approve", "Reject"],
     )
-    if isinstance(response, dict):
-        return bool(response.get("approved"))
-    return parse_approval_response(str(response))
+    return bool(approved)
 
 
 async def confirm_plan(*, summary: str, prompt: str, context: Any) -> bool:
     channel = context.channel("ui:session")
     await channel.send_text(summary)
-    response = await channel.ask_approval(
+    approved, _choice, _choice_label, _text, _matched = await channel.ask_approval(
         prompt=prompt,
         options=["Confirm", "Cancel"],
     )
-    if isinstance(response, dict):
-        return bool(response.get("approved"))
-    return parse_approval_response(str(response))
+    return bool(approved)
 
 async def apply_user_inputs(
     *,
